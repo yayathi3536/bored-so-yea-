@@ -1,0 +1,6 @@
+{
+  "name": "Our Little Universe",
+  "description": "An intimate, cinematic romantic universe created with love.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,219 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: 'Cormorant Garamond', Georgia, serif;
+  --font-handwriting: 'Caveat', cursive;
+  --font-cute: 'Quicksand', system-ui, sans-serif;
+  --font-bubbly: 'Fredoka', cursive, sans-serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+  
+  --color-baby-pink: #FFD6E7;
+  --color-cotton-pink: #FFBFD7;
+  --color-cream: #FFF8EF;
+  --color-peach: #FFE0CC;
+  --color-lavender: #E9DFFF;
+  --color-baby-blue: #DDF1FF;
+  --color-mint: #DFF4E4;
+  --color-warm-brown: #765563;
+  --breakpoint-xs: 380px;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #FFF8EF;
+  color: #765563;
+  font-family: 'Quicksand', 'Plus Jakarta Sans', system-ui, sans-serif;
+  overflow-x: hidden;
+  user-select: auto;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Cute pastel candy scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(255, 248, 239, 0.9);
+}
+::-webkit-scrollbar-thumb {
+  background: #FFBFD7;
+  border-radius: 9999px;
+  border: 2px solid #FFF8EF;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #FF9EBE;
+}
+
+/* 3D Envelope Perspectives */
+.perspective-1000 {
+  perspective: 1000px;
+}
+.perspective-2000 {
+  perspective: 2000px;
+}
+.transform-style-preserve-3d {
+  transform-style: preserve-3d;
+}
+.backface-hidden {
+  backface-visibility: hidden;
+}
+
+.rotate-x-0 {
+  transform: rotateX(0deg);
+}
+
+.-rotate-x-180 {
+  transform: rotateX(-180deg);
+}
+
+/* Cute stationery paper textures */
+.paper-texture {
+  background-color: #FFF8EF;
+  background-image: 
+    radial-gradient(#FFBFD7 1px, transparent 1px),
+    radial-gradient(#FFE0CC 0.8px, transparent 0.8px);
+  background-size: 24px 24px, 12px 12px;
+}
+
+.scrapbook-paper {
+  background-color: #FFF8EF;
+  background-image: radial-gradient(#FFD6E7 1.2px, transparent 1.2px);
+  background-size: 18px 18px;
+}
+
+/* Cute soft text shadow */
+.text-cute-shadow {
+  text-shadow: 0 2px 6px rgba(255, 191, 215, 0.5);
+}
+
+/* Animations */
+@keyframes cuteWiggle {
+  0%, 100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-3deg);
+  }
+  75% {
+    transform: rotate(3deg);
+  }
+}
+
+.animate-wiggle {
+  animation: cuteWiggle 0.6s ease-in-out;
+}
+
+.group:hover .group-hover-wiggle {
+  animation: cuteWiggle 0.6s ease-in-out infinite;
+}
+
+@keyframes gentleBounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.animate-gentle-bounce {
+  animation: gentleBounce 2.5s ease-in-out infinite;
+}
+
+@keyframes earWiggle {
+  0%, 100% {
+    transform: rotate(0deg);
+  }
+  30% {
+    transform: rotate(4deg);
+  }
+  60% {
+    transform: rotate(-3deg);
+  }
+}
+
+.animate-ear-wiggle {
+  animation: earWiggle 3s ease-in-out infinite;
+}
+
+@keyframes cuteFloat {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-6px) rotate(1deg);
+  }
+}
+
+.animate-cute-float {
+  animation: cuteFloat 5s ease-in-out infinite;
+}
+
+@keyframes floatHeart {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(0.8) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-80px) scale(1.2) rotate(14deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-160px) scale(1.4) rotate(-14deg);
+  }
+}
+
+.animate-float-heart {
+  animation: floatHeart 2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes butterflyFlutter {
+  0%, 100% {
+    transform: translate(0, 0) rotate(0deg) scale(1);
+  }
+  25% {
+    transform: translate(15px, -18px) rotate(6deg) scale(1.05);
+  }
+  50% {
+    transform: translate(30px, -5px) rotate(-4deg) scale(0.95);
+  }
+  75% {
+    transform: translate(18px, 12px) rotate(3deg) scale(1.02);
+  }
+}
+
+.animate-butterfly {
+  animation: butterflyFlutter 8s ease-in-out infinite;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-6px); }
+  40%, 80% { transform: translateX(6px); }
+}
+
+.animate-shake {
+  animation: shake 0.4s ease-in-out;
+}
+

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { MemoryItem } from '../../types';
 import { Heart, X, ChevronRight, Sparkles, BookOpen } from 'lucide-react';
 import { audioEngine } from '../../utils/audio';
+import { resolveAssetUrl } from '../../utils/assetPath';
 
 interface ScrapbookSceneProps {
   memories: MemoryItem[];
@@ -128,7 +129,7 @@ export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext
                         <div className="relative aspect-[4/3] w-full rounded-xl overflow-hidden bg-[#FFE0CC]/30 border border-[#FFBFD7]/70 shadow-inner mt-1">
                           {mem.imageUrl ? (
                             <img
-                              src={mem.imageUrl}
+                              src={resolveAssetUrl(mem.imageUrl)}
                               alt={mem.title}
                               className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700"
                               onError={(e) => {
@@ -210,7 +211,7 @@ export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext
             {selectedMemory.imageUrl && (
               <div className="mb-4 sm:mb-5 rounded-2xl overflow-hidden aspect-[16/9] border-2 border-[#FFBFD7]/60 shadow-sm bg-[#FFE0CC]/30">
                 <img
-                  src={selectedMemory.imageUrl}
+                  src={resolveAssetUrl(selectedMemory.imageUrl)}
                   alt={selectedMemory.title}
                   className="w-full h-full object-cover"
                 />

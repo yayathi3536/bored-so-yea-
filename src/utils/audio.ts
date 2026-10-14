@@ -1,3 +1,5 @@
+import { resolveAssetUrl } from './assetPath';
+
 // Interactive Web Audio API engine for ambient romantic soundtrack and interactive chimes
 
 class CosmicAudioEngine {
@@ -53,13 +55,14 @@ class CosmicAudioEngine {
 
   public play(customUrl?: string) {
     this.initContext();
-    const targetUrl = customUrl && customUrl.trim().length > 0 ? customUrl : this.currentAudioUrl;
+    const rawUrl = customUrl && customUrl.trim().length > 0 ? customUrl : this.currentAudioUrl;
+    const targetUrl = resolveAssetUrl(rawUrl);
 
     if (targetUrl) {
       if (!this.audioElement) {
         this.audioElement = new Audio(targetUrl);
         this.audioElement.loop = true;
-      } else if (this.audioElement.src !== window.location.origin + targetUrl && this.audioElement.src !== targetUrl) {
+      } else if (this.audioElement.src !== targetUrl && !this.audioElement.src.endsWith(targetUrl)) {
         this.audioElement.src = targetUrl;
       }
       this.audioElement.volume = this.isMuted ? 0 : this.volume;

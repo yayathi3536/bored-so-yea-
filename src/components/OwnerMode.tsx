@@ -23,6 +23,7 @@ import {
   Music,
 } from 'lucide-react';
 import { audioEngine } from '../utils/audio';
+import { resolveAssetUrl } from '../utils/assetPath';
 
 interface OwnerModeProps {
   data: UniverseData;
@@ -622,7 +623,7 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                         <div className="w-full aspect-square max-w-[200px] rounded-xl overflow-hidden border-2 border-[#FFBFD7] bg-white relative group shadow-inner">
                           {mem.imageUrl ? (
                             <img
-                              src={mem.imageUrl}
+                              src={resolveAssetUrl(mem.imageUrl)}
                               alt={mem.title}
                               className="w-full h-full object-cover"
                             />

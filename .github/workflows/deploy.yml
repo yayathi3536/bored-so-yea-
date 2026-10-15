@@ -32,6 +32,16 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
+      - name: Verify Supabase anon key is configured
+        env:
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || secrets.SUPABASE_KEY || '' }}
+        run: |
+          if [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "::error::No Supabase anon key secret found. Without it the published site cannot load cloud content on any browser that has not had the key pasted into Owner Mode. Add a repository secret named VITE_SUPABASE_ANON_KEY (anon/publishable key only, never service_role)."
+            exit 1
+          fi
+          echo "Supabase anon key secret is present (value not printed)."
+
       - name: Build production bundle
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || secrets.SUPABASE_URL || 'https://updbgvanowpgjbkdliyo.supabase.co' }}

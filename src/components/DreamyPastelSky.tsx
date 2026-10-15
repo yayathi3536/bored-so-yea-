@@ -83,8 +83,8 @@ export const DreamyPastelSky: React.FC<DreamyPastelSkyProps> = ({
     let hearts: FloatingHeart[] = [];
     let sparkles: Sparkle[] = [];
 
-    const heartColors = ['#FFD6E7', '#FFBFD7', '#FFA3BA', '#E9DFFF', '#FFE0CC'];
-    const sparkleColors = ['#FFF8EF', '#FFBFD7', '#FFE0CC', '#D6B779', '#DDF1FF'];
+    const heartColors = ['#F8C8DC', '#E99AB5', '#FFD8C2', '#E6DDF5', '#FFF0B3'];
+    const sparkleColors = ['#FFF8F0', '#F8C8DC', '#FFF0B3', '#E6DDF5', '#FFD8C2'];
 
     const daisyCount = Math.min(22, Math.floor((width * height) / 38000));
     const heartCount = Math.min(18, Math.floor((width * height) / 45000));

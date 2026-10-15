@@ -18,6 +18,7 @@ import { SecretsScene } from './components/scenes/SecretsScene';
 import { TreasureBoxScene } from './components/scenes/TreasureBoxScene';
 import { FinalScene } from './components/scenes/FinalScene';
 import { CuteBunny } from './components/CuteBunny';
+import { HeartRain } from './components/HeartRain';
 import { audioEngine } from './utils/audio';
 import { Sparkles, Edit3, Check, X, Shield, Cloud, RefreshCw, CheckCircle2 } from 'lucide-react';
 import {
@@ -297,10 +298,32 @@ export default function App() {
   };
 
   const [isTransitioning, setIsTransitioning] = useState(false);
+  const [heartRainBurstId, setHeartRainBurstId] = useState(0);
 
-  const changeScene = (nextScene: SceneId) => {
+  const SCENE_ORDER: SceneId[] = ['opening', 'envelope', 'scrapbook', 'secrets', 'treasure', 'final'];
+
+  const triggerHeartRain = () => {
+    setHeartRainBurstId((prev) => prev + 1);
+  };
+
+  const handleNextInNavigation = () => {
+    const currentIndex = SCENE_ORDER.indexOf(currentScene);
+    const nextIdx = (currentIndex + 1) % SCENE_ORDER.length;
+    const nextScene = SCENE_ORDER[nextIdx];
+    triggerHeartRain();
+    changeScene(nextScene, true);
+  };
+
+  const changeScene = (nextScene: SceneId, isExplicitNext: boolean = false) => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
     audioEngine.playChime(1.1);
+
+    const currIdx = SCENE_ORDER.indexOf(currentScene);
+    const nextIdx = SCENE_ORDER.indexOf(nextScene);
+    if (isExplicitNext || nextIdx > currIdx) {
+      triggerHeartRain();
+    }
+
     if (currentScene === 'opening' && nextScene === 'envelope') {
       setIsTransitioning(true);
       setTimeout(() => {
@@ -317,7 +340,7 @@ export default function App() {
     currentScene === 'final' ? 'sunset' : currentScene === 'opening' ? 'ambient' : 'bright';
 
   return (
-    <div className="relative min-h-screen w-full bg-[#FFF8EF] text-[#765563] flex flex-col font-['Quicksand'] selection:bg-[#FFD6E7] selection:text-[#765563] overflow-x-hidden">
+    <div className="relative min-h-screen w-full bg-[#FFF8F0] text-[#765563] flex flex-col font-['Quicksand'] selection:bg-[#F8C8DC] selection:text-[#765563] overflow-x-hidden">
       {/* 60fps Floating Daisies, Hearts & Pastel Clouds Background */}
       <DreamyPastelSky
         intensity={skyIntensity}
@@ -325,11 +348,14 @@ export default function App() {
         isTransitioning={isTransitioning}
       />
 
+      {/* Screen-wide Heart Rain Particle Effect on Next Navigation */}
+      <HeartRain burstId={heartRainBurstId} />
+
       {/* Floating Preview Banner (Only visible when preview mode is active) */}
       {isPreviewActive && (
-        <aside aria-label="Preview Mode" className="fixed top-3 sm:top-4 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1.5rem)] max-w-md bg-[#FFFDF9]/95 backdrop-blur-md border-2 border-[#FFBFD7] shadow-xl px-3 sm:px-4 py-1.5 sm:py-2 rounded-full flex items-center justify-between gap-1.5 sm:gap-3 animate-fadeIn">
+        <aside aria-label="Preview Mode" className="fixed top-3 sm:top-4 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1.5rem)] max-w-md bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-3 sm:px-4 py-1.5 sm:py-2 rounded-full flex items-center justify-between gap-1.5 sm:gap-3 animate-fadeIn">
           <div className="flex items-center gap-1 sm:gap-1.5 text-[11px] sm:text-xs font-['Fredoka'] font-semibold text-[#765563] truncate">
-            <Sparkles className="w-3.5 h-3.5 text-[#FF85A1] shrink-0" />
+            <Sparkles className="w-3.5 h-3.5 text-[#E99AB5] shrink-0" />
             <span className="truncate">Preview Mode</span>
           </div>
 
@@ -339,9 +365,9 @@ export default function App() {
                 setIsPreviewActive(false);
                 setIsOwnerModeOpen(true);
               }}
-              className="px-2.5 sm:px-3 py-1 rounded-full bg-[#FFD6E7] hover:bg-[#FFBFD7] text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+              className="px-2.5 sm:px-3 py-1 rounded-full bg-[#F8C8DC] hover:bg-[#E99AB5]/30 text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold flex items-center gap-1 cursor-pointer transition-colors"
             >
-              <Edit3 className="w-3 h-3 text-[#FF85A1]" />
+              <Edit3 className="w-3 h-3 text-[#E99AB5]" />
               <span className="hidden xs:inline">Editor</span>
               <span className="xs:hidden">Edit</span>
             </button>
@@ -350,7 +376,7 @@ export default function App() {
               onClick={() => {
                 if (previewData) handleSaveData(previewData);
               }}
-              className="px-2.5 sm:px-3.5 py-1 rounded-full bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold border border-[#FFA3BA] flex items-center gap-1 cursor-pointer shadow-xs transition-all"
+              className="px-2.5 sm:px-3.5 py-1 rounded-full bg-gradient-to-r from-[#F8C8DC] via-[#FFD8C2] to-[#FFF0B3] hover:from-[#E99AB5] hover:to-[#F8C8DC] text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold border border-white flex items-center gap-1 cursor-pointer shadow-xs transition-all"
             >
               <Check className="w-3 h-3 text-[#765563]" />
               <span>Save</span>
@@ -370,10 +396,11 @@ export default function App() {
         </aside>
       )}
 
-      {/* Top Celestial Navigation (Completely clean of editing controls for visitors) */}
+      {/* Top Celestial Navigation */}
       <CelestialNav
         currentScene={currentScene}
-        onSelectScene={changeScene}
+        onSelectScene={(scene) => changeScene(scene)}
+        onNextScene={handleNextInNavigation}
         recipientName={activeData.recipientName}
       />
 
@@ -385,7 +412,7 @@ export default function App() {
             subText={activeData.opening.sub}
             buttonText={activeData.opening.buttonText}
             recipientName={activeData.recipientName}
-            onEnter={() => changeScene('envelope')}
+            onEnter={() => changeScene('envelope', true)}
           />
         )}
 
@@ -395,21 +422,21 @@ export default function App() {
             paragraphs={activeData.mainLetter.paragraphs}
             signature={activeData.mainLetter.signature}
             dateStr={activeData.mainLetter.date}
-            onNext={() => changeScene('scrapbook')}
+            onNext={() => changeScene('scrapbook', true)}
           />
         )}
 
         {currentScene === 'scrapbook' && (
           <ScrapbookScene
             memories={activeData.memories}
-            onNext={() => changeScene('secrets')}
+            onNext={() => changeScene('secrets', true)}
           />
         )}
 
         {currentScene === 'secrets' && (
           <SecretsScene
             insideJokes={activeData.insideJokes}
-            onNext={() => changeScene('treasure')}
+            onNext={() => changeScene('treasure', true)}
           />
         )}
 
@@ -418,7 +445,7 @@ export default function App() {
             letters={activeData.letters}
             recipientName={activeData.recipientName}
             senderName={activeData.senderName}
-            onNext={() => changeScene('final')}
+            onNext={() => changeScene('final', true)}
           />
         )}
 
@@ -427,7 +454,7 @@ export default function App() {
             finalLetter={activeData.finalLetter}
             recipientName={activeData.recipientName}
             senderName={activeData.senderName}
-            onRevisitFirst={() => changeScene('opening')}
+            onRevisitFirst={() => changeScene('opening', true)}
           />
         )}
       </main>
@@ -444,7 +471,7 @@ export default function App() {
 
       {/* Romantic Subtle Footer with Discreet Owner Flower Trigger */}
       <footer className="relative z-20 pt-8 pb-20 sm:pb-8 px-4 text-center select-none mt-auto">
-        <div className="inline-flex max-w-full flex-wrap justify-center items-center gap-1.5 sm:gap-2 px-3.5 sm:px-4 py-1.5 rounded-full bg-[#FFF8EF]/80 backdrop-blur-xs border border-[#FFBFD7]/40 text-[11px] sm:text-xs font-['Quicksand'] text-[#765563]/70 shadow-xs">
+        <div className="inline-flex max-w-full flex-wrap justify-center items-center gap-1.5 sm:gap-2 px-3.5 sm:px-4 py-1.5 rounded-full bg-[#FFF8F0]/90 backdrop-blur-xs border border-[#F8C8DC] text-[11px] sm:text-xs font-['Quicksand'] text-[#765563]/80 shadow-xs">
           <span>made with so much love for {activeData.recipientName}</span>
           <button
             type="button"
@@ -460,7 +487,7 @@ export default function App() {
 
         {/* Subtle sparkle indicator when owner is clicking towards 5 clicks */}
         {flowerClicks > 0 && flowerClicks < 5 && (
-          <div className="text-[11px] text-[#FF85A1] font-bold mt-1.5 tracking-widest animate-fadeIn">
+          <div className="text-[11px] text-[#E99AB5] font-bold mt-1.5 tracking-widest animate-fadeIn">
             {'✨ '.repeat(flowerClicks)}
           </div>
         )}
@@ -470,9 +497,9 @@ export default function App() {
       {toastNotification && (
         <aside
           aria-label="Cloud sync notification"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-sm w-[calc(100%-2rem)] bg-[#FFFDF9]/95 backdrop-blur-md border-2 border-[#FFBFD7] shadow-xl px-4 py-2.5 rounded-2xl flex items-center gap-2.5 animate-fadeIn text-[#765563]"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-sm w-[calc(100%-2rem)] bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-4 py-2.5 rounded-2xl flex items-center gap-2.5 animate-fadeIn text-[#765563]"
         >
-          <Sparkles className="w-4 h-4 text-[#FF85A1] shrink-0" />
+          <Sparkles className="w-4 h-4 text-[#E99AB5] shrink-0" />
           <span className="text-xs font-['Quicksand'] font-semibold flex-1">
             {toastNotification.message}
           </span>

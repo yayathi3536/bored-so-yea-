@@ -6,6 +6,7 @@ export interface MemoryItem {
   description: string;
   story: string;
   imageUrl?: string;
+  storagePath?: string;
   tags?: string[];
   rotationDeg?: number;
 }

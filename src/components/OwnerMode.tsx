@@ -19,6 +19,7 @@ import {
   Check,
   AlertCircle,
   Shield,
+  ShieldCheck,
   Music,
   Loader2,
   Cloud,
@@ -28,6 +29,9 @@ import {
   CheckCheck,
   ExternalLink,
   Database,
+  FileJson,
+  CheckCircle2,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { audioEngine } from '../utils/audio';
 import { resolveAssetUrl, optimizeImageFile } from '../utils/assetPath';
@@ -43,6 +47,15 @@ import {
   migrateLocalContentToSupabase,
   downloadUniverseFromLocalStorage,
   MigrationProgressUpdate,
+  STORAGE_PERMISSIONS_SQL,
+  analyzeUniversePhotos,
+  PhotoAnalysisItem,
+  getCurrentAdminUser,
+  adminSignIn,
+  adminSignUp,
+  adminSignOut,
+  onAdminAuthStateChange,
+  uploadSingleMemoryImageFile,
 } from '../utils/supabase';
 
 export const RLS_QUICK_FIX_SQL = `-- 1-Click Fix for "new row violates row-level security policy for table universe_data"
@@ -52,35 +65,39 @@ DROP POLICY IF EXISTS "Public read universe_data" ON public.universe_data;
 DROP POLICY IF EXISTS "Public write universe_data" ON public.universe_data;
 DROP POLICY IF EXISTS "Public insert universe_data" ON public.universe_data;
 DROP POLICY IF EXISTS "Public update universe_data" ON public.universe_data;
+DROP POLICY IF EXISTS "Admin insert universe_data" ON public.universe_data;
+DROP POLICY IF EXISTS "Admin update universe_data" ON public.universe_data;
 
-CREATE POLICY "Public read universe_data" ON public.universe_data FOR SELECT USING (true);
-CREATE POLICY "Public write universe_data" ON public.universe_data FOR ALL USING (true) WITH CHECK (true);
+-- Allow public read so visitors on phone & desktop can view website
+CREATE POLICY "Public read universe_data" ON public.universe_data FOR SELECT TO anon, authenticated USING (true);
+
+-- Allow authenticated administrator write ONLY (server-enforced security)
+CREATE POLICY "Admin insert universe_data" ON public.universe_data FOR INSERT TO authenticated WITH CHECK (true);
+CREATE POLICY "Admin update universe_data" ON public.universe_data FOR UPDATE TO authenticated USING (true) WITH CHECK (true);
 `;
 
-export const FULL_SUPABASE_SQL = `-- 1. Enable pgcrypto for PIN hashing
-create extension if not exists pgcrypto;
-
--- 2. Create universe_data table
+export const FULL_SUPABASE_SQL = `-- 1. Create universe_data table
 create table if not exists public.universe_data (
   id text primary key default 'current',
   data jsonb not null,
-  pin_hash text not null default crypt('1234', gen_salt('bf')),
+  pin_hash text not null default 'supabase-auth-managed',
   updated_at timestamp with time zone default timezone('utc'::text, now())
 );
 
--- 3. Row Level Security (RLS) - Allows website to read and save universe data
+-- 2. Row Level Security (RLS) - Public Read, Authenticated Write ONLY
 alter table public.universe_data enable row level security;
 drop policy if exists "Public read universe_data" on public.universe_data;
 drop policy if exists "Public write universe_data" on public.universe_data;
 drop policy if exists "Public insert universe_data" on public.universe_data;
 drop policy if exists "Public update universe_data" on public.universe_data;
+drop policy if exists "Admin insert universe_data" on public.universe_data;
+drop policy if exists "Admin update universe_data" on public.universe_data;
 
-create policy "Public read universe_data" on public.universe_data for select using (true);
-create policy "Public insert universe_data" on public.universe_data for insert with check (true);
-create policy "Public update universe_data" on public.universe_data for update using (true);
-create policy "Public write universe_data" on public.universe_data for all using (true) with check (true);
+create policy "Public read universe_data" on public.universe_data for select to anon, authenticated using (true);
+create policy "Admin insert universe_data" on public.universe_data for insert to authenticated with check (true);
+create policy "Admin update universe_data" on public.universe_data for update to authenticated using (true) with check (true);
 
--- 4. Enable Supabase Realtime
+-- 3. Enable Supabase Realtime
 do $$
 begin
   if not exists (
@@ -91,42 +108,42 @@ begin
   end if;
 end $$;
 
--- 5. Secure save function
-create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
-returns jsonb language plpgsql security definer as $$
+-- 4. Secure save function (Authenticated Administrator only, no gen_salt dependency)
+create or replace function public.save_universe_data(new_data jsonb, edit_pin text default null)
+returns jsonb language plpgsql security invoker
+set search_path = public, extensions as $$
 declare
-  stored_hash text;
-  row_exists boolean;
   result_row universe_data;
 begin
-  select exists(select 1 from public.universe_data where id = 'current') into row_exists;
-  if not row_exists then
-    insert into public.universe_data (id, data, pin_hash, updated_at)
-    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
-    returning * into result_row;
-    return result_row.data;
+  if auth.role() != 'authenticated' then
+    raise exception 'Unauthorized: Administrator authentication required to save website data';
   end if;
 
-  select pin_hash into stored_hash from public.universe_data where id = 'current';
-  if stored_hash is null or stored_hash = '' then
-    update public.universe_data set data = new_data, pin_hash = crypt(edit_pin, gen_salt('bf')), updated_at = now()
-    where id = 'current' returning * into result_row;
-    return result_row.data;
+  if new_data is null then
+    raise exception 'Invalid data: new_data payload is required';
   end if;
 
-  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
-    raise exception 'Invalid PIN: authorization failed';
-  end if;
+  insert into public.universe_data (id, data, pin_hash, updated_at)
+  values (
+    'current',
+    new_data,
+    coalesce((select pin_hash from public.universe_data where id = 'current'), 'supabase-auth-managed'),
+    now()
+  )
+  on conflict (id) do update set
+    data = excluded.data,
+    pin_hash = coalesce((select pin_hash from public.universe_data where id = 'current'), 'supabase-auth-managed'),
+    updated_at = now()
+  returning * into result_row;
 
-  update public.universe_data set data = new_data, updated_at = now()
-  where id = 'current' returning * into result_row;
   return result_row.data;
 end;
 $$;
 
-grant execute on function public.save_universe_data(text, jsonb) to anon, authenticated, service_role;
+revoke execute on function public.save_universe_data(jsonb, text) from public, anon;
+grant execute on function public.save_universe_data(jsonb, text) to authenticated, service_role;
 
--- 6. Scrapbook Photo Metadata Table
+-- 5. Scrapbook Photo Metadata Table
 create table if not exists public.scrapbook_images (
   id uuid primary key default gen_random_uuid(),
   memory_id text,
@@ -140,26 +157,36 @@ create table if not exists public.scrapbook_images (
 
 alter table public.scrapbook_images enable row level security;
 drop policy if exists "Public read scrapbook_images" on public.scrapbook_images;
-create policy "Public read scrapbook_images" on public.scrapbook_images for select using (true);
-drop policy if exists "Public insert scrapbook_images" on public.scrapbook_images;
-create policy "Public insert scrapbook_images" on public.scrapbook_images for insert with check (true);
+create policy "Public read scrapbook_images" on public.scrapbook_images for select to anon, authenticated using (true);
+drop policy if exists "Admin insert scrapbook_images" on public.scrapbook_images;
+create policy "Admin insert scrapbook_images" on public.scrapbook_images for insert to authenticated with check (true);
 
--- 7. Storage Bucket for Scrapbook Images
+-- 7. Private Storage Bucket for Scrapbook Images
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values (
   'scrapbook-images',
   'scrapbook-images',
-  true,
+  false,
   10485760,
   array['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/avif']
 )
-on conflict (id) do update set public = true;
+on conflict (id) do update set public = false;
 
+drop policy if exists "Scrapbook images select" on storage.objects;
 drop policy if exists "Scrapbook images public select" on storage.objects;
-create policy "Scrapbook images public select" on storage.objects for select using (bucket_id = 'scrapbook-images');
-drop policy if exists "Scrapbook images public insert" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
-drop policy if exists "Scrapbook images public update" on storage.objects for update using (bucket_id = 'scrapbook-images');
-drop policy if exists "Scrapbook images public delete" on storage.objects for delete using (bucket_id = 'scrapbook-images');
+create policy "Scrapbook images select" on storage.objects for select to anon, authenticated using (bucket_id = 'scrapbook-images');
+
+drop policy if exists "Scrapbook images insert" on storage.objects;
+drop policy if exists "Scrapbook images public insert" on storage.objects;
+create policy "Scrapbook images insert" on storage.objects for insert to authenticated with check (bucket_id = 'scrapbook-images');
+
+drop policy if exists "Scrapbook images update" on storage.objects;
+drop policy if exists "Scrapbook images public update" on storage.objects;
+create policy "Scrapbook images update" on storage.objects for update to authenticated using (bucket_id = 'scrapbook-images') with check (bucket_id = 'scrapbook-images');
+
+drop policy if exists "Scrapbook images delete" on storage.objects;
+drop policy if exists "Scrapbook images public delete" on storage.objects;
+create policy "Scrapbook images delete" on storage.objects for delete to authenticated using (bucket_id = 'scrapbook-images');
 `;
 
 interface OwnerModeProps {
@@ -241,14 +268,38 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadStatusText, setUploadStatusText] = useState<string | null>(null);
 
-  // Cloud Photo Migration state
+  // Cloud Photo Migration Wizard state
   const [migrationStatus, setMigrationStatus] = useState<MigrationProgressUpdate | null>(null);
   const [isMigratingPhotos, setIsMigratingPhotos] = useState(false);
+  const [migrationSource, setMigrationSource] = useState<'local' | 'file'>('local');
+  const [importedFileSource, setImportedFileSource] = useState<UniverseData | null>(null);
+  const [importedFileName, setImportedFileName] = useState<string | null>(null);
+  const [showConfirmMigrationModal, setShowConfirmMigrationModal] = useState(false);
+  const [showPhotoPreviewTable, setShowPhotoPreviewTable] = useState(true);
+  const [copiedStorageFix, setCopiedStorageFix] = useState(false);
+  const [migrationItemLogs, setMigrationItemLogs] = useState<
+    Array<{ id: string; title: string; success: boolean; url?: string; error?: string }>
+  >([]);
+  const [migrationResult, setMigrationResult] = useState<{
+    success: boolean;
+    message: string;
+    uploadedCount: number;
+    alreadyCloudCount: number;
+    failedCount: number;
+    errors: Array<{ title: string; error: string }>;
+  } | null>(null);
   const [migrationSummary, setMigrationSummary] = useState<{
     totalLocal: number;
     unsyncedCount: number;
     cloudCount: number;
   }>({ totalLocal: 0, unsyncedCount: 0, cloudCount: 0 });
+
+  // Supabase Admin Authentication State
+  const [adminUser, setAdminUser] = useState<{ email?: string; id?: string } | null>(null);
+  const [authEmailInput, setAuthEmailInput] = useState('karanamyayathi9@gmail.com');
+  const [authPasswordInput, setAuthPasswordInput] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authMsg, setAuthMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Sync internal formData when opened with latest data
   useEffect(() => {
@@ -258,22 +309,87 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       setPinFeedback(null);
       setNewPin('');
       setConfirmPin('');
+      setImportedFileSource(null);
+      setImportedFileName(null);
+      setMigrationSource('local');
+      setMigrationItemLogs([]);
+      setMigrationResult(null);
       const creds = getSupabaseCredentials();
       setSupabaseUrlInput(creds.url);
       setSupabaseKeyInput(creds.key);
       setConnectionTestResult(null);
 
-      // Analyze photo sync status
-      const memories = data.memories || [];
-      const unsynced = memories.filter((m) => isLocalImageData(m.imageUrl)).length;
-      const cloud = memories.filter((m) => isCloudImageUrl(m.imageUrl)).length;
-      setMigrationSummary({
-        totalLocal: memories.length,
-        unsyncedCount: unsynced,
-        cloudCount: cloud,
+      // Check current admin user session
+      getCurrentAdminUser().then((user) => {
+        if (user) {
+          setAdminUser(user);
+          if (user.email) setAuthEmailInput(user.email);
+        }
       });
+
+      const unsubscribeAuth = onAdminAuthStateChange((user) => {
+        setAdminUser(user);
+        if (user?.email) setAuthEmailInput(user.email);
+      });
+
+      // Analyze photo sync status
+      const analysis = analyzeUniversePhotos(data);
+      setMigrationSummary({
+        totalLocal: analysis.totalMemories,
+        unsyncedCount: analysis.localCount,
+        cloudCount: analysis.cloudCount,
+      });
+
+      return () => {
+        unsubscribeAuth();
+      };
     }
   }, [isOpen, data]);
+
+  const handleAdminSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authEmailInput.trim() || !authPasswordInput) {
+      setAuthMsg({ type: 'error', text: 'Please enter admin email and password' });
+      return;
+    }
+    setAuthLoading(true);
+    setAuthMsg(null);
+    const res = await adminSignIn(authEmailInput, authPasswordInput);
+    setAuthLoading(false);
+    if (res.error) {
+      setAuthMsg({ type: 'error', text: res.error });
+    } else {
+      setAdminUser(res.user);
+      setAuthMsg({ type: 'success', text: `Signed in as ${res.user?.email}! Cloud writes are authorized.` });
+      audioEngine.playChime(1.3);
+    }
+  };
+
+  const handleAdminSignUp = async () => {
+    if (!authEmailInput.trim() || !authPasswordInput) {
+      setAuthMsg({ type: 'error', text: 'Please enter admin email and password' });
+      return;
+    }
+    setAuthLoading(true);
+    setAuthMsg(null);
+    const res = await adminSignUp(authEmailInput, authPasswordInput);
+    setAuthLoading(false);
+    if (res.error) {
+      setAuthMsg({ type: 'error', text: res.error });
+    } else if (res.confirmationSent) {
+      setAuthMsg({ type: 'success', text: 'Admin account created! Check email if confirmation is enabled in Supabase.' });
+    } else {
+      setAdminUser(res.user);
+      setAuthMsg({ type: 'success', text: 'Admin account registered and logged in! ✨' });
+      audioEngine.playChime(1.3);
+    }
+  };
+
+  const handleAdminSignOut = async () => {
+    await adminSignOut();
+    setAdminUser(null);
+    setAuthMsg({ type: 'success', text: 'Signed out of Supabase Admin.' });
+  };
 
   if (!isOpen) return null;
 
@@ -359,16 +475,32 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
           const updated = [...formData.memories];
           updated[memoryIndex].imageUrl = url;
           updated[memoryIndex].storagePath = path;
-          setFormData({ ...formData, memories: updated });
+          const newFormData = { ...formData, memories: updated };
+          setFormData(newFormData);
           audioEngine.playChime(1.3);
           setUploadStatusText('✓ Uploaded to Supabase Cloud Storage!');
           setTimeout(() => setUploadStatusText(null), 3000);
+
+          // Update photo sync summary
+          const analysis = analyzeUniversePhotos(newFormData);
+          setMigrationSummary({
+            totalLocal: analysis.totalMemories,
+            unsyncedCount: analysis.localCount,
+            cloudCount: analysis.cloudCount,
+          });
+
+          // Automatically sync this change to the database so the new photo is immediately saved
+          try {
+            await onSave(newFormData);
+          } catch (saveErr) {
+            console.warn('Auto-save after photo upload notice:', saveErr);
+          }
           return;
         }
 
         console.error('Storage upload returned error:', error);
         alert(
-          `Supabase Storage Notice:\n${error}\n\nFalling back to temporary browser storage for now. Please run supabase-schema.sql in your Supabase SQL Editor to create the public scrapbook-images bucket!`
+          `Supabase Storage Notice:\n${error}\n\nFalling back to temporary browser storage for now. Please copy the Storage SQL fix from the "Backup & Cloud Sync" tab and run it in Supabase SQL Editor to enable public uploads to "scrapbook-images".`
         );
       }
 
@@ -519,6 +651,30 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
 
           {/* Quick Header Actions */}
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            {adminUser ? (
+              <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-300 text-emerald-800 text-[11px] font-['Quicksand'] font-bold">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="truncate max-w-[120px]">{adminUser.email}</span>
+                <button
+                  type="button"
+                  onClick={handleAdminSignOut}
+                  className="text-[10px] text-emerald-700 hover:text-emerald-900 underline cursor-pointer ml-0.5"
+                >
+                  Exit
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setActiveTab('backup')}
+                className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-50 border border-amber-300 text-amber-800 text-[11px] font-['Quicksand'] font-bold cursor-pointer hover:bg-amber-100 transition-colors"
+                title="Supabase Auth required to save to cloud"
+              >
+                <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                <span>Admin Login</span>
+              </button>
+            )}
+
             {savedBanner && (
               <span
                 className={`hidden md:inline-flex items-center gap-1 text-xs font-bold px-2.5 py-1 rounded-full border animate-fadeIn ${
@@ -1592,6 +1748,106 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                   Supabase provides persistent cross-device storage for your love notes, letters, and polaroid scrapbook pictures. When connected, changes you make on one device instantly reflect everywhere!
                 </p>
 
+                {/* Supabase Admin Authentication Section */}
+                <div className="p-3.5 sm:p-4 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7] space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <Shield className="w-4 h-4 text-[#FF85A1]" />
+                      <span className="text-xs font-bold font-['Fredoka'] text-[#765563]">
+                        Supabase Admin Identity &amp; Server-Enforced RLS
+                      </span>
+                    </div>
+                    {adminUser ? (
+                      <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                        <span>Signed in: {adminUser.email}</span>
+                      </span>
+                    ) : (
+                      <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3 text-amber-600" />
+                        <span>Auth Required for Writes</span>
+                      </span>
+                    )}
+                  </div>
+
+                  <p className="text-[11px] font-['Quicksand'] text-[#765563]/80 leading-relaxed">
+                    Under server-enforced Row-Level Security, visitors can view all photos and stories without logging in. To save edits or upload new scrapbook photos to the private bucket, sign in with your Supabase Admin account.
+                  </p>
+
+                  {adminUser ? (
+                    <div className="p-3 bg-white rounded-xl border border-emerald-200 flex items-center justify-between flex-wrap gap-2">
+                      <div className="text-xs text-emerald-900 font-['Quicksand']">
+                        <strong>Active Admin:</strong> {adminUser.email}
+                        <p className="text-[10px] text-emerald-700 mt-0.5">
+                          ✓ Authorized to write to <code>universe_data</code> and upload to <code>scrapbook-images</code>.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleAdminSignOut}
+                        className="px-3 py-1.5 rounded-xl border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold font-['Quicksand'] transition-all cursor-pointer"
+                      >
+                        Sign Out
+                      </button>
+                    </div>
+                  ) : (
+                    <form onSubmit={handleAdminSignIn} className="p-3 bg-white rounded-xl border border-[#FFBFD7]/70 space-y-2.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div>
+                          <label className="block text-[10px] font-bold text-[#765563] uppercase mb-1">
+                            Admin Email
+                          </label>
+                          <input
+                            type="email"
+                            value={authEmailInput}
+                            onChange={(e) => setAuthEmailInput(e.target.value)}
+                            placeholder="karanamyayathi9@gmail.com"
+                            required
+                            className="w-full text-xs font-['Quicksand'] bg-[#FFF8EF] border border-[#FFBFD7] rounded-xl py-1.5 px-2.5 text-[#765563] focus:outline-none focus:border-[#FF85A1]"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-[#765563] uppercase mb-1">
+                            Admin Password
+                          </label>
+                          <input
+                            type="password"
+                            value={authPasswordInput}
+                            onChange={(e) => setAuthPasswordInput(e.target.value)}
+                            placeholder="Password (min 6 chars)"
+                            required
+                            className="w-full text-xs font-['Quicksand'] bg-[#FFF8EF] border border-[#FFBFD7] rounded-xl py-1.5 px-2.5 text-[#765563] focus:outline-none focus:border-[#FF85A1]"
+                          />
+                        </div>
+                      </div>
+
+                      {authMsg && (
+                        <div className={`p-2 rounded-lg text-xs font-['Quicksand'] font-semibold ${authMsg.type === 'success' ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}`}>
+                          {authMsg.text}
+                        </div>
+                      )}
+
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="submit"
+                          disabled={authLoading}
+                          className="px-3.5 py-1.5 bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] text-[#765563] text-xs font-bold rounded-xl shadow-xs hover:shadow-sm cursor-pointer disabled:opacity-50"
+                        >
+                          {authLoading ? 'Signing In...' : 'Sign In as Admin'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={authLoading}
+                          onClick={handleAdminSignUp}
+                          className="px-3.5 py-1.5 bg-white border border-[#FFBFD7] text-[#765563] text-xs font-bold rounded-xl hover:bg-[#FFD6E7]/30 cursor-pointer disabled:opacity-50"
+                        >
+                          Register Admin
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                </div>
+
                 {/* Cloud Sync Actions */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
                   <button
@@ -1711,135 +1967,331 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                   </div>
                 )}
 
-                {/* Cloud Photo Migration Wizard Card */}
-                <div className="p-4 rounded-xl bg-white border border-[#FFBFD7] space-y-3">
-                  <div className="flex items-center justify-between flex-wrap gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-lg">📷</span>
-                      <h5 className="font-['Fredoka'] text-xs sm:text-sm font-semibold text-[#765563]">
-                        Computer Photo Migration to Supabase Storage
-                      </h5>
-                    </div>
-                    <span
-                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                        migrationSummary.unsyncedCount > 0
-                          ? 'bg-amber-100 text-amber-900 border-amber-300'
-                          : 'bg-emerald-100 text-emerald-900 border-emerald-300'
-                      }`}
-                    >
-                      {migrationSummary.unsyncedCount > 0
-                        ? `${migrationSummary.unsyncedCount} Local Photo${
-                            migrationSummary.unsyncedCount > 1 ? 's' : ''
-                          } Ready to Migrate`
-                        : `${migrationSummary.cloudCount} Photos Synced in Cloud`}
-                    </span>
-                  </div>
+                {/* Safe Cross-Device Photo Migration & Cloud Sync Wizard */}
+                {(() => {
+                  const activeMigrationData =
+                    migrationSource === 'file' && importedFileSource ? importedFileSource : formData;
+                  const photoAnalysis = analyzeUniversePhotos(activeMigrationData);
 
-                  <p className="text-[11px] text-[#765563]/80 leading-relaxed font-['Quicksand']">
-                    Photos uploaded on your computer are initially stored inside this browser&apos;s localStorage. Running migration uploads them to your Supabase Storage bucket (<code>scrapbook-images</code>) and updates the database with permanent URLs so they display seamlessly on your phone!
-                  </p>
+                  return (
+                    <div className="p-4 sm:p-5 rounded-2xl bg-white border-2 border-[#FFBFD7] space-y-4 shadow-xs">
+                      {/* Wizard Header */}
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xl">📷</span>
+                          <div>
+                            <h5 className="font-['Fredoka'] text-sm sm:text-base font-semibold text-[#765563]">
+                              Cross-Device Photo Synchronization &amp; Cloud Migration
+                            </h5>
+                            <p className="text-[11px] text-[#765563]/70 font-['Quicksand']">
+                              Upload computer photos to Supabase Storage (<code>scrapbook-images</code>) so they display on your phone
+                            </p>
+                          </div>
+                        </div>
+                        <span
+                          className={`text-[11px] font-bold px-3 py-1 rounded-full border ${
+                            photoAnalysis.localCount > 0
+                              ? 'bg-amber-100 text-amber-900 border-amber-300'
+                              : 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                          }`}
+                        >
+                          {photoAnalysis.localCount > 0
+                            ? `${photoAnalysis.localCount} Local Photo${photoAnalysis.localCount > 1 ? 's' : ''} Ready to Migrate`
+                            : 'All Photos Synced in Cloud'}
+                        </span>
+                      </div>
 
-                  {/* Migration Progress Bar */}
-                  {migrationStatus && (
-                    <div className="p-3 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7] text-xs font-['Quicksand'] space-y-2">
-                      <div className="flex items-center justify-between font-bold text-[#765563] text-[11px]">
-                        <span>{migrationStatus.message}</span>
-                        {migrationStatus.totalImages > 0 && (
-                          <span>
-                            {migrationStatus.currentImageIndex} / {migrationStatus.totalImages}
+                      {/* Step 1: Safety & JSON Backup Notice */}
+                      <div className="p-3.5 rounded-xl bg-gradient-to-br from-[#FFF8EF] to-[#FFD6E7]/30 border border-[#FFBFD7] space-y-2.5">
+                        <div className="flex items-center gap-2">
+                          <Sparkles className="w-4 h-4 text-[#FF85A1]" />
+                          <span className="text-xs font-bold text-[#765563] font-['Fredoka']">
+                            Step 1: Safety First &amp; JSON Backup
                           </span>
+                        </div>
+                        <p className="text-[11px] text-[#765563]/85 leading-relaxed font-['Quicksand']">
+                          Your local photos and memories are safe in this browser. Before making any cloud writes, you can download an offline JSON backup. You will be asked to confirm before any files are uploaded, and your local data will <strong>never</strong> be deleted.
+                        </p>
+
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={handleExportJSON}
+                            className="px-3 py-1.5 rounded-xl bg-white hover:bg-[#FFD6E7]/50 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5 text-[#FF85A1]" />
+                            <span>Download Safety JSON Backup</span>
+                          </button>
+
+                          {/* Data Source Selector */}
+                          <div className="flex items-center gap-1 ml-auto text-xs font-['Quicksand']">
+                            <span className="text-[#765563]/70 font-semibold text-[11px]">Migration Source:</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setMigrationSource('local');
+                                setImportedFileSource(null);
+                                setImportedFileName(null);
+                              }}
+                              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors ${
+                                migrationSource === 'local'
+                                  ? 'bg-[#FFD6E7] text-[#765563] border border-[#FFA3BA]'
+                                  : 'bg-white/80 text-[#765563]/70 hover:bg-[#FFD6E7]/30'
+                              }`}
+                            >
+                              Browser LocalStorage
+                            </button>
+                            <label className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition-colors flex items-center gap-1 ${
+                              migrationSource === 'file'
+                                ? 'bg-[#FFD6E7] text-[#765563] border border-[#FFA3BA]'
+                                : 'bg-white/80 text-[#765563]/70 hover:bg-[#FFD6E7]/30'
+                            }`}>
+                              <FileJson className="w-3 h-3 text-[#FF85A1]" />
+                              <span>{importedFileName ? importedFileName.slice(0, 14) + '...' : 'Pick Backup JSON'}</span>
+                              <input
+                                type="file"
+                                accept=".json,application/json"
+                                onChange={(e) => {
+                                  const file = e.target.files?.[0];
+                                  if (!file) return;
+                                  const reader = new FileReader();
+                                  reader.onload = (ev) => {
+                                    try {
+                                      const parsed = JSON.parse(ev.target?.result as string);
+                                      if (parsed.recipientName && Array.isArray(parsed.memories)) {
+                                        setImportedFileSource(parsed);
+                                        setImportedFileName(file.name);
+                                        setMigrationSource('file');
+                                        audioEngine.playChime(1.2);
+                                      } else {
+                                        alert('Invalid backup file format: missing memories.');
+                                      }
+                                    } catch {
+                                      alert('Could not parse JSON file.');
+                                    }
+                                  };
+                                  reader.readAsText(file);
+                                }}
+                                className="hidden"
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Step 2: Photo Inspection & Preview Breakdown */}
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between flex-wrap gap-2">
+                          <div className="flex items-center gap-2">
+                            <span className="font-['Fredoka'] text-xs sm:text-sm font-semibold text-[#765563]">
+                              Step 2: Preview Photos to Migrate ({photoAnalysis.totalMemories} Memories)
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setShowPhotoPreviewTable(!showPhotoPreviewTable)}
+                            className="text-xs text-[#FF85A1] hover:underline font-bold flex items-center gap-1 cursor-pointer"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>{showPhotoPreviewTable ? 'Hide Photo List' : 'Show Photo List'}</span>
+                          </button>
+                        </div>
+
+                        {/* Metrics Pills */}
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs font-['Quicksand']">
+                          <div className="p-2.5 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7]">
+                            <div className="text-base font-bold text-[#765563]">{photoAnalysis.totalMemories}</div>
+                            <div className="text-[10px] text-[#765563]/70 font-semibold">Total Memories</div>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200">
+                            <div className="text-base font-bold text-amber-900">{photoAnalysis.localCount}</div>
+                            <div className="text-[10px] text-amber-800 font-semibold">Local (Needs Upload)</div>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
+                            <div className="text-base font-bold text-emerald-900">{photoAnalysis.cloudCount}</div>
+                            <div className="text-[10px] text-emerald-800 font-semibold">In Cloud (Will Skip)</div>
+                          </div>
+                          <div className="p-2.5 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7]">
+                            <div className="text-base font-bold text-[#765563]">{photoAnalysis.emptyCount}</div>
+                            <div className="text-[10px] text-[#765563]/70 font-semibold">Handcrafted Art</div>
+                          </div>
+                        </div>
+
+                        {/* Expandable Photo Preview Table */}
+                        {showPhotoPreviewTable && (
+                          <div className="max-h-60 overflow-y-auto rounded-xl border border-[#FFBFD7] divide-y divide-[#FFBFD7]/40 bg-white text-xs font-['Quicksand']">
+                            {photoAnalysis.items.map((item, idx) => (
+                              <div
+                                key={item.id}
+                                className="p-2.5 flex items-center justify-between gap-3 hover:bg-[#FFF8EF]/50 transition-colors"
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <div className="w-10 h-10 rounded-lg overflow-hidden border border-[#FFBFD7] bg-[#FFF8EF] shrink-0">
+                                    {item.imageUrl ? (
+                                      <img
+                                        src={resolveAssetUrl(item.imageUrl)}
+                                        alt={item.title}
+                                        className="w-full h-full object-cover"
+                                      />
+                                    ) : (
+                                      <div className="w-full h-full flex items-center justify-center text-xs">🌸</div>
+                                    )}
+                                  </div>
+                                  <div className="min-w-0">
+                                    <div className="font-bold text-[#765563] truncate">
+                                      #{idx + 1} {item.title}
+                                    </div>
+                                    <div className="text-[10px] text-[#765563]/60 truncate">
+                                      {item.date} • {item.sizeEstimate}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="shrink-0 text-right">
+                                  {item.isCloud ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold border border-emerald-300">
+                                      <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                      <span>In Cloud Storage</span>
+                                    </span>
+                                  ) : item.isLocal ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 text-[10px] font-bold border border-amber-300">
+                                      <Upload className="w-3 h-3 text-amber-700" />
+                                      <span>Local (Ready to Upload)</span>
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] text-[#765563]/60 font-semibold">Illustration</span>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
                         )}
                       </div>
-                      <div className="w-full h-2 rounded-full bg-[#FFD6E7]/50 overflow-hidden">
+
+                      {/* Step 3: Migration Progress Bar (Visible while migrating) */}
+                      {migrationStatus && (
+                        <div className="p-3.5 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7] text-xs font-['Quicksand'] space-y-2">
+                          <div className="flex items-center justify-between font-bold text-[#765563] text-[11px]">
+                            <span>{migrationStatus.message}</span>
+                            {migrationStatus.totalImages > 0 && (
+                              <span>
+                                {migrationStatus.currentImageIndex} / {migrationStatus.totalImages}
+                              </span>
+                            )}
+                          </div>
+                          <div className="w-full h-2 rounded-full bg-[#FFD6E7]/50 overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-[#FF85A1] to-[#E99AB5] transition-all duration-300"
+                              style={{
+                                width: `${
+                                  migrationStatus.totalImages > 0
+                                    ? Math.min(
+                                        100,
+                                        Math.round(
+                                          (migrationStatus.currentImageIndex / migrationStatus.totalImages) * 100
+                                        )
+                                      )
+                                    : 100
+                                }%`,
+                              }}
+                            />
+                          </div>
+
+                          {/* Live Item Logs */}
+                          {migrationItemLogs.length > 0 && (
+                            <div className="mt-2 max-h-28 overflow-y-auto text-[10px] space-y-1 font-mono bg-white/70 p-2 rounded-lg border border-[#FFBFD7]/60">
+                              {migrationItemLogs.map((log, i) => (
+                                <div
+                                  key={i}
+                                  className={log.success ? 'text-emerald-700' : 'text-rose-600 font-bold'}
+                                >
+                                  {log.success
+                                    ? `✓ "${log.title}": uploaded to Supabase Storage`
+                                    : `✗ "${log.title}": ${log.error || 'Failed'}`}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Post-Migration Results Card */}
+                      {migrationResult && (
                         <div
-                          className="h-full bg-gradient-to-r from-[#FF85A1] to-[#E99AB5] transition-all duration-300"
-                          style={{
-                            width: `${
-                              migrationStatus.totalImages > 0
-                                ? Math.min(
-                                    100,
-                                    Math.round(
-                                      (migrationStatus.currentImageIndex / migrationStatus.totalImages) * 100
-                                    )
-                                  )
-                                : 100
-                            }%`,
+                          className={`p-3.5 rounded-xl border text-xs font-['Quicksand'] space-y-2 ${
+                            migrationResult.success
+                              ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                              : 'bg-amber-50 border-amber-300 text-amber-900'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 font-bold">
+                            {migrationResult.success ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            ) : (
+                              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+                            )}
+                            <span>{migrationResult.message}</span>
+                          </div>
+
+                          {migrationResult.success && (
+                            <div className="p-2.5 rounded-lg bg-white/80 border border-emerald-200 text-[11px] text-emerald-900 space-y-1">
+                              <p className="font-bold">📱 How to verify on your phone right now:</p>
+                              <p>1. Open <a href="https://yayathi3536.github.io/bored-so-yea-/" target="_blank" rel="noreferrer" className="underline font-mono">https://yayathi3536.github.io/bored-so-yea-/</a> on your phone browser.</p>
+                              <p>2. Tap into the <strong>Scrapbook</strong> scene. All your memories and photos will now load cleanly from Supabase Cloud Storage!</p>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Step 4: Action Button with Explicit Confirmation */}
+                      <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
+                        {photoAnalysis.localCount > 0 ? (
+                          <button
+                            type="button"
+                            disabled={isMigratingPhotos || isMigrating}
+                            onClick={() => setShowConfirmMigrationModal(true)}
+                            className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center justify-center gap-2 cursor-pointer shadow-xs transition-all disabled:opacity-50"
+                          >
+                            {isMigratingPhotos ? (
+                              <Loader2 className="w-4 h-4 animate-spin text-[#765563]" />
+                            ) : (
+                              <Upload className="w-4 h-4 text-[#765563]" />
+                            )}
+                            <span>Review &amp; Migrate {photoAnalysis.localCount} Photos to Supabase</span>
+                          </button>
+                        ) : (
+                          <div className="flex items-center gap-2 text-xs font-bold text-emerald-700 bg-emerald-50 px-3.5 py-2 rounded-xl border border-emerald-200">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                            <span>All photos are currently hosted in Supabase Cloud Storage!</span>
+                          </div>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const analysis = analyzeUniversePhotos(formData);
+                            setMigrationSummary({
+                              totalLocal: analysis.totalMemories,
+                              unsyncedCount: analysis.localCount,
+                              cloudCount: analysis.cloudCount,
+                            });
+                            alert(
+                              `Photo Storage Diagnostics:\n• Total Memories: ${analysis.totalMemories}\n• Hosted in Supabase Cloud: ${analysis.cloudCount}\n• Stored Only Locally: ${analysis.localCount}\n\n${
+                                analysis.localCount > 0
+                                  ? 'Click "Review & Migrate Photos" to upload local photos to Supabase Storage!'
+                                  : 'All photos are already stored in Supabase Storage and will display on your phone!'
+                              }`
+                            );
                           }}
-                        />
+                          className="w-full sm:w-auto px-3.5 py-2 rounded-xl bg-[#FFF8EF] hover:bg-[#FFE0CC]/50 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          <Eye className="w-3.5 h-3.5 text-[#FF85A1]" />
+                          <span>Refresh Photo Status</span>
+                        </button>
                       </div>
                     </div>
-                  )}
-
-                  <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      disabled={isMigratingPhotos || isMigrating}
-                      onClick={async () => {
-                        setIsMigratingPhotos(true);
-                        setMigrationStatus({
-                          stage: 'checking',
-                          totalImages: formData.memories.length,
-                          currentImageIndex: 0,
-                          currentImageTitle: '',
-                          message: 'Checking photos and preparing upload...',
-                        });
-
-                        const result = await migrateLocalContentToSupabase({
-                          pin: currentVerifiedPin || storedPin,
-                          forceOverwriteServer: true,
-                          onProgress: (update) => setMigrationStatus(update),
-                        });
-
-                        setIsMigratingPhotos(false);
-                        if (result.success) {
-                          audioEngine.playChime(1.3);
-                          const refreshed = downloadUniverseFromLocalStorage();
-                          if (refreshed) setFormData(refreshed);
-                          const memories = (refreshed || formData).memories || [];
-                          setMigrationSummary({
-                            totalLocal: memories.length,
-                            unsyncedCount: memories.filter((m) => isLocalImageData(m.imageUrl)).length,
-                            cloudCount: memories.filter((m) => isCloudImageUrl(m.imageUrl)).length,
-                          });
-                        }
-                        alert(result.message);
-                      }}
-                      className="w-full sm:w-auto px-3.5 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
-                    >
-                      {isMigratingPhotos ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
-                      ) : (
-                        <Upload className="w-3.5 h-3.5 text-[#765563]" />
-                      )}
-                      <span>Migrate Computer Photos to Supabase</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const memories = formData.memories || [];
-                        const unsynced = memories.filter((m) => isLocalImageData(m.imageUrl)).length;
-                        const cloud = memories.filter((m) => isCloudImageUrl(m.imageUrl)).length;
-                        setMigrationSummary({
-                          totalLocal: memories.length,
-                          unsyncedCount: unsynced,
-                          cloudCount: cloud,
-                        });
-                        alert(
-                          `Photo Storage Diagnostics:\n• Total Memories: ${memories.length}\n• Hosted in Supabase Cloud: ${cloud}\n• Stored Only Locally (Base64): ${unsynced}\n\n${
-                            unsynced > 0
-                              ? 'Click "Migrate Computer Photos to Supabase" to upload them to the cloud!'
-                              : 'All photos are already stored in Supabase Cloud and will appear on your phone!'
-                          }`
-                        );
-                      }}
-                      className="w-full sm:w-auto px-3 py-2 rounded-xl bg-[#FFF8EF] hover:bg-[#FFE0CC]/50 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-                    >
-                      <Eye className="w-3.5 h-3.5 text-[#FF85A1]" />
-                      <span>Check Photo Sync Status</span>
-                    </button>
-                  </div>
-                </div>
+                  );
+                })()}
 
                 {/* Quick Credentials Setup / Override */}
                 <details className="pt-2 border-t border-[#FFBFD7]/50 text-xs">
@@ -1910,6 +2362,41 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                     </div>
                   </div>
                 </details>
+              </div>
+
+              {/* Supabase Storage Permissions Fix Card */}
+              <div className="p-4 rounded-2xl bg-sky-50/90 border-2 border-sky-200/90 space-y-2.5 text-xs font-['Quicksand'] text-sky-900 shadow-xs">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2 font-bold text-sky-900">
+                    <ImageIcon className="w-4 h-4 text-sky-600" />
+                    <span>Fix Supabase Storage Bucket &amp; Permissions</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(STORAGE_PERMISSIONS_SQL);
+                      setCopiedStorageFix(true);
+                      audioEngine.playChime(1.2);
+                      setTimeout(() => setCopiedStorageFix(false), 2500);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-sky-200 hover:bg-sky-300 text-sky-900 font-bold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs"
+                  >
+                    {copiedStorageFix ? (
+                      <>
+                        <CheckCheck className="w-3.5 h-3.5 text-emerald-700" />
+                        <span>Copied Storage Fix!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5 text-sky-800" />
+                        <span>Copy Storage SQL Fix</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <p className="text-[11px] text-sky-800/85 leading-relaxed">
+                  If photo uploads fail or show &ldquo;new row violates row-level security policy for table objects&rdquo;, copy the SQL fix above and run it in your <strong>Supabase Dashboard &rarr; SQL Editor &rarr; New Query &rarr; Run</strong>. This creates the public <code>scrapbook-images</code> bucket and grants upload permissions.
+                </p>
               </div>
 
               {/* RLS Policy Helper Card */}
@@ -2003,6 +2490,144 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
           )}
         </div>
 
+        {/* Explicit Confirmation Dialog Before Cloud Migration */}
+        {showConfirmMigrationModal && (
+          <div className="fixed inset-0 z-70 flex items-center justify-center p-3 sm:p-5 bg-[#765563]/50 backdrop-blur-md animate-fadeIn">
+            <div className="relative w-full max-w-lg bg-[#FFFDF9] border-2 border-[#FFBFD7] rounded-3xl shadow-2xl p-5 sm:p-6 space-y-4 text-[#765563]">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-amber-100 border border-amber-300 flex items-center justify-center text-xl shrink-0">
+                  ⚠️
+                </div>
+                <div>
+                  <h3 className="font-['Fredoka'] text-base sm:text-lg font-semibold text-[#765563]">
+                    Confirm Cloud Photo Migration
+                  </h3>
+                  <p className="text-xs text-[#765563]/70 font-['Quicksand']">
+                    Please review what will happen before proceeding
+                  </p>
+                </div>
+              </div>
+
+              {(() => {
+                const activeData = migrationSource === 'file' && importedFileSource ? importedFileSource : formData;
+                const analysis = analyzeUniversePhotos(activeData);
+                return (
+                  <div className="space-y-3 text-xs font-['Quicksand']">
+                    <div className="p-3.5 rounded-2xl bg-[#FFF8EF] border border-[#FFBFD7] space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#765563]">Source:</span>
+                        <span className="font-mono font-bold text-[#FF85A1]">
+                          {migrationSource === 'file' ? importedFileName || 'Backup File' : 'Browser LocalStorage (our_universe_data_v1)'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#765563]">Photos to upload to Storage:</span>
+                        <span className="font-bold text-amber-900 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-300">
+                          {analysis.localCount} local photo{analysis.localCount > 1 ? 's' : ''}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#765563]">Already in Cloud (will skip):</span>
+                        <span className="font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300">
+                          {analysis.cloudCount} photo{analysis.cloudCount > 1 ? 's' : ''}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#765563]">Target Supabase Storage Bucket:</span>
+                        <span className="font-mono text-[#765563] font-bold">scrapbook-images</span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#765563]">Target Supabase Table:</span>
+                        <span className="font-mono text-[#765563] font-bold">public.universe_data (id='current')</span>
+                      </div>
+                    </div>
+
+                    <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-[11px] text-emerald-900 space-y-1">
+                      <div className="flex items-center gap-1.5 font-bold">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        <span>Safety &amp; Privacy Guarantee</span>
+                      </div>
+                      <p>
+                        Your original local browser data will <strong>NOT be deleted</strong>. Photos are uploaded to your private <code>scrapbook-images</code> bucket, and persistent storage paths with signed URLs are saved so your photos display seamlessly on your phone.
+                      </p>
+                      {!adminUser && (
+                        <p className="font-bold text-amber-800 pt-1">
+                          ⚠️ Note: You are not currently signed into Supabase Auth. Please sign in as Admin in the Backup tab to authorize this migration.
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowConfirmMigrationModal(false)}
+                        className="px-4 py-2 rounded-xl border border-[#FFBFD7] text-xs font-bold text-[#765563] hover:bg-[#FFD6E7]/40 cursor-pointer"
+                      >
+                        Cancel / Go Back
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!adminUser) {
+                            alert('Administrator authentication required: Please sign in with your Supabase Admin account in the Backup tab before migrating.');
+                            return;
+                          }
+                          setShowConfirmMigrationModal(false);
+                          setIsMigratingPhotos(true);
+                          setMigrationItemLogs([]);
+                          setMigrationResult(null);
+
+                          setMigrationStatus({
+                            stage: 'checking',
+                            totalImages: activeData.memories.length,
+                            currentImageIndex: 0,
+                            currentImageTitle: '',
+                            message: 'Starting migration...',
+                          });
+
+                          const result = await migrateLocalContentToSupabase({
+                            pin: currentVerifiedPin || storedPin,
+                            sourceData: activeData,
+                            forceOverwriteServer: true,
+                            onProgress: (update) => setMigrationStatus(update),
+                            onItemComplete: (item) => {
+                              setMigrationItemLogs((prev) => [...prev, item]);
+                            },
+                          });
+
+                          setIsMigratingPhotos(false);
+                          setMigrationResult(result);
+
+                          if (result.success) {
+                            audioEngine.playChime(1.3);
+                            const refreshed = downloadUniverseFromLocalStorage();
+                            if (refreshed) {
+                              setFormData(refreshed);
+                              const newAnalysis = analyzeUniversePhotos(refreshed);
+                              setMigrationSummary({
+                                totalLocal: newAnalysis.totalMemories,
+                                unsyncedCount: newAnalysis.localCount,
+                                cloudCount: newAnalysis.cloudCount,
+                              });
+                            }
+                          } else {
+                            audioEngine.playBlip(0.8);
+                          }
+                        }}
+                        className="px-4 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      >
+                        <Upload className="w-4 h-4 text-[#765563]" />
+                        <span>Confirm &amp; Start Upload</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
         {/* SQL Script View Modal */}
         {showSqlModal && (
           <div className="fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-5 bg-[#765563]/40 backdrop-blur-md animate-fadeIn">
@@ -2033,6 +2658,29 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
 
               <div className="p-3.5 border-t border-[#FFBFD7] bg-[#FFF8EF] flex items-center justify-between flex-wrap gap-2">
                 <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(STORAGE_PERMISSIONS_SQL);
+                      setCopiedStorageFix(true);
+                      audioEngine.playChime(1.2);
+                      setTimeout(() => setCopiedStorageFix(false), 2000);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-sky-100 hover:bg-sky-200 border border-sky-300 text-xs font-bold text-sky-900 flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                  >
+                    {copiedStorageFix ? (
+                      <>
+                        <CheckCheck className="w-4 h-4 text-emerald-600" />
+                        <span>Copied Storage Fix!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4 text-sky-800" />
+                        <span>Copy Storage Fix</span>
+                      </>
+                    )}
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => {

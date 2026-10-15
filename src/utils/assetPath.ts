@@ -19,7 +19,9 @@ export function resolveAssetUrl(url: string | undefined): string {
 
   // If path is a Supabase Storage path like scrapbook/...
   if (trimmed.startsWith('scrapbook/')) {
-    return `https://updbgvanowpgjbkdliyo.supabase.co/storage/v1/object/public/scrapbook-images/${trimmed}`;
+    const customUrl = typeof localStorage !== 'undefined' ? localStorage.getItem('romantic_supabase_url_v1') : null;
+    const baseSupabaseUrl = (customUrl?.trim() || import.meta.env.VITE_SUPABASE_URL || 'https://updbgvanowpgjbkdliyo.supabase.co').replace(/\/+$/, '');
+    return `${baseSupabaseUrl}/storage/v1/object/public/scrapbook-images/${trimmed}`;
   }
 
   // Normalize legacy image names or aliases

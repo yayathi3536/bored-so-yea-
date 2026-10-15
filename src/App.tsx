@@ -145,11 +145,6 @@ export default function App() {
               localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
             } catch {}
             setCloudSyncStatus('synced');
-          } else if (!error && testRes.tableFound) {
-            // Table exists but is empty: automatically seed with current data
-            console.log('Seeding initial website data to Supabase database...');
-            await saveUniverseToSupabase(data, storedPin);
-            setCloudSyncStatus('synced');
           } else {
             setCloudSyncStatus(testRes.connected ? 'synced' : 'error');
           }

@@ -362,7 +362,11 @@ export async function testSupabaseConnection(): Promise<{
 // Database Operations: Fetch & Authorized Save
 // -------------------------------------------------------------
 
-export async function fetchUniverseFromSupabase(): Promise<{ data: UniverseData | null; error?: string }> {
+export async function fetchUniverseFromSupabase(): Promise<{
+  data: UniverseData | null;
+  error?: string;
+  updatedAt?: string | null;
+}> {
   const supabase = getSupabase();
   if (!supabase) return { data: null, error: 'Supabase credentials not configured.' };
 
@@ -379,12 +383,12 @@ export async function fetchUniverseFromSupabase(): Promise<{ data: UniverseData 
     }
 
     if (!data || !data.data) {
-      return { data: null };
+      return { data: null, error: 'No row returned from universe_data (empty table or read blocked by RLS).' };
     }
 
     const rawData = data.data as UniverseData;
     const refreshed = await refreshUniverseSignedUrls(rawData);
-    return { data: refreshed };
+    return { data: refreshed, updatedAt: (data.updated_at as string | null) ?? null };
   } catch (err: any) {
     return { data: null, error: err.message || 'Unknown network error' };
   }
@@ -1106,7 +1110,9 @@ export async function uploadSingleMemoryImageFile(
   return { success: true, updatedUniverse: newUniverse };
 }
 
-export function subscribeToUniverseChanges(onUpdate: (newData: UniverseData) => void): () => void {
+export function subscribeToUniverseChanges(
+  onUpdate: (newData: UniverseData, updatedAt?: string | null) => void
+): () => void {
   const supabase = getSupabase();
   if (!supabase) return () => {};
 
@@ -1124,7 +1130,7 @@ export function subscribeToUniverseChanges(onUpdate: (newData: UniverseData) => 
           if (payload?.new?.data) {
             const rawData = payload.new.data as UniverseData;
             const refreshed = await refreshUniverseSignedUrls(rawData);
-            onUpdate(refreshed);
+            onUpdate(refreshed, (payload.new.updated_at as string | null | undefined) ?? null);
           }
         }
       )

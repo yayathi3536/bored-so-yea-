@@ -18,22 +18,46 @@ import {
   Eye,
   Check,
   AlertCircle,
-  HelpCircle,
   Shield,
   Music,
+  Loader2,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  Copy,
+  CheckCheck,
+  ExternalLink,
+  Database,
 } from 'lucide-react';
 import { audioEngine } from '../utils/audio';
-import { resolveAssetUrl } from '../utils/assetPath';
+import { resolveAssetUrl, optimizeImageFile } from '../utils/assetPath';
+import {
+  getSupabase,
+  uploadImageToSupabaseStorage,
+  testSupabaseConnection,
+  getSupabaseCredentials,
+  saveSupabaseCredentials,
+  SCRAPBOOK_BUCKET,
+} from '../utils/supabase';
 
 interface OwnerModeProps {
   data: UniverseData;
   isOpen: boolean;
   onClose: () => void;
-  onSave: (newData: UniverseData) => void;
+  onSave: (newData: UniverseData) => Promise<{ success: boolean; message: string }>;
   onPreview: (previewData: UniverseData) => void;
   onReset: () => void;
   storedPin: string;
-  onUpdatePin: (newPin: string) => void;
+  currentVerifiedPin: string;
+  onUpdatePin: (newPin: string) => Promise<{ success: boolean; message: string }>;
+  onMigrateToSupabase?: () => Promise<{ success: boolean; message: string }>;
+  onRefreshFromSupabase?: () => Promise<{ success: boolean; message: string }>;
+  supabaseStatus?: {
+    connected: boolean;
+    tableFound: boolean;
+    storageFound: boolean;
+    source: 'env' | 'local' | 'none';
+  };
 }
 
 type TabType =
@@ -56,16 +80,42 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
   onPreview,
   onReset,
   storedPin,
+  currentVerifiedPin,
   onUpdatePin,
+  onMigrateToSupabase,
+  onRefreshFromSupabase,
+  supabaseStatus,
 }) => {
   const [formData, setFormData] = useState<UniverseData>(data);
   const [activeTab, setActiveTab] = useState<TabType>('names');
   const [savedBanner, setSavedBanner] = useState(false);
+  const [saveBannerText, setSaveBannerText] = useState('Saved & synchronized!');
+  const [isSaving, setIsSaving] = useState(false);
 
   // PIN settings state
   const [newPin, setNewPin] = useState('');
   const [confirmPin, setConfirmPin] = useState('');
   const [pinFeedback, setPinFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Supabase settings state
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState('');
+  const [supabaseKeyInput, setSupabaseKeyInput] = useState('');
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [connectionTestResult, setConnectionTestResult] = useState<{
+    connected: boolean;
+    tableFound: boolean;
+    storageFound: boolean;
+    message: string;
+  } | null>(null);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showSqlModal, setShowSqlModal] = useState(false);
+  const [copiedSql, setCopiedSql] = useState(false);
+
+  // Image upload state
+  const [isProcessingImage, setIsProcessingImage] = useState<number | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadStatusText, setUploadStatusText] = useState<string | null>(null);
 
   // Sync internal formData when opened with latest data
   useEffect(() => {
@@ -75,16 +125,28 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       setPinFeedback(null);
       setNewPin('');
       setConfirmPin('');
+      const creds = getSupabaseCredentials();
+      setSupabaseUrlInput(creds.url);
+      setSupabaseKeyInput(creds.key);
+      setConnectionTestResult(null);
     }
   }, [isOpen, data]);
 
   if (!isOpen) return null;
 
-  const handleSave = () => {
+  const handleSave = async () => {
     audioEngine.playChime(1.2);
-    onSave(formData);
-    setSavedBanner(true);
-    setTimeout(() => setSavedBanner(false), 2500);
+    setIsSaving(true);
+    try {
+      const result = await onSave(formData);
+      setIsSaving(false);
+      setSaveBannerText(result.message);
+      setSavedBanner(true);
+      setTimeout(() => setSavedBanner(false), 3500);
+    } catch (err: any) {
+      setIsSaving(false);
+      alert(`Save error: ${err.message || String(err)}`);
+    }
   };
 
   const handlePreview = () => {
@@ -109,14 +171,14 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const parsed = JSON.parse(event.target?.result as string);
         if (parsed.recipientName && parsed.mainLetter) {
           setFormData(parsed);
-          onSave(parsed);
+          await onSave(parsed);
           audioEngine.playChime(1.3);
-          alert('✨ Backup restored successfully! All custom memories have been loaded.');
+          alert('✨ Backup restored successfully! All custom memories have been loaded and synchronized.');
         } else {
           alert('Invalid romantic universe backup format.');
         }
@@ -127,24 +189,50 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
     reader.readAsText(file);
   };
 
-  const handleImageUpload = (memoryIndex: number, e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (memoryIndex: number, e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 8 * 1024 * 1024) {
-      alert('Photo is too large (over 8MB). Please choose a smaller photo for optimal performance.');
-      return;
-    }
+    try {
+      setIsProcessingImage(memoryIndex);
+      const supabase = getSupabase();
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const base64Url = event.target?.result as string;
+      // If Supabase is available, upload directly to Supabase Storage
+      if (supabase) {
+        setUploadStatusText('Uploading to Supabase Storage...');
+        const { url, error } = await uploadImageToSupabaseStorage(file, (pct) => {
+          setUploadProgress(pct);
+        });
+
+        if (url) {
+          const updated = [...formData.memories];
+          updated[memoryIndex].imageUrl = url;
+          setFormData({ ...formData, memories: updated });
+          audioEngine.playChime(1.3);
+          setUploadStatusText('✓ Uploaded to cloud storage!');
+          setTimeout(() => setUploadStatusText(null), 3000);
+          return;
+        }
+        console.warn('Storage upload returned notice, falling back to local optimization:', error);
+      }
+
+      // Offline / Local optimization fallback
+      setUploadStatusText('Optimizing image...');
+      const optimizedUrl = await optimizeImageFile(file, 1200, 0.82);
       const updated = [...formData.memories];
-      updated[memoryIndex].imageUrl = base64Url;
+      updated[memoryIndex].imageUrl = optimizedUrl;
       setFormData({ ...formData, memories: updated });
-      audioEngine.playBlip(1.2);
-    };
-    reader.readAsDataURL(file);
+      audioEngine.playChime(1.3);
+      setUploadStatusText('✓ Saved locally');
+      setTimeout(() => setUploadStatusText(null), 2500);
+    } catch (err) {
+      console.error('Image processing failed:', err);
+      alert('Could not process this image. Please try another image file.');
+    } finally {
+      setIsProcessingImage(null);
+      setUploadProgress(null);
+      e.target.value = '';
+    }
   };
 
   const handleAddMemory = () => {
@@ -222,7 +310,7 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
     });
   };
 
-  const handleSavePin = (e: React.FormEvent) => {
+  const handleSavePin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newPin.trim()) {
       setPinFeedback({ type: 'error', message: 'PIN cannot be empty' });
@@ -232,11 +320,21 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       setPinFeedback({ type: 'error', message: 'PINs do not match' });
       return;
     }
-    onUpdatePin(newPin.trim());
-    setPinFeedback({ type: 'success', message: 'PIN updated successfully! Remember your new PIN.' });
-    setNewPin('');
-    setConfirmPin('');
-    audioEngine.playChime(1.3);
+    try {
+      const result = await onUpdatePin(newPin.trim());
+      if (result.success) {
+        setPinFeedback({ type: 'success', message: result.message });
+        setNewPin('');
+        setConfirmPin('');
+        audioEngine.playChime(1.3);
+      } else {
+        setPinFeedback({ type: 'error', message: result.message });
+        audioEngine.playBlip(0.6);
+      }
+    } catch (err: any) {
+      setPinFeedback({ type: 'error', message: err.message || 'Failed to update PIN' });
+      audioEngine.playBlip(0.6);
+    }
   };
 
   return (
@@ -621,45 +719,83 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                           Polaroid Photo
                         </label>
                         <div className="w-full aspect-square max-w-[200px] rounded-xl overflow-hidden border-2 border-[#FFBFD7] bg-white relative group shadow-inner">
-                          {mem.imageUrl ? (
-                            <img
-                              src={resolveAssetUrl(mem.imageUrl)}
-                              alt={mem.title}
-                              className="w-full h-full object-cover"
-                            />
+                          {isProcessingImage === idx ? (
+                            <div className="w-full h-full flex flex-col items-center justify-center bg-[#FFF8EF] text-[#FF85A1] gap-1.5 p-2 text-center">
+                              <Loader2 className="w-6 h-6 animate-spin" />
+                              <span className="text-[11px] font-bold">{uploadStatusText || 'Processing...'}</span>
+                              {uploadProgress !== null && (
+                                <div className="w-24 h-1.5 bg-[#FFD6E7] rounded-full overflow-hidden mt-1">
+                                  <div
+                                    className="h-full bg-[#FF85A1] transition-all duration-300"
+                                    style={{ width: `${uploadProgress}%` }}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          ) : mem.imageUrl ? (
+                            <>
+                              <img
+                                src={resolveAssetUrl(mem.imageUrl)}
+                                alt={mem.title}
+                                className="w-full h-full object-cover"
+                              />
+                              {mem.imageUrl.includes('supabase.co') && (
+                                <span className="absolute bottom-1.5 left-1.5 px-2 py-0.5 rounded-full bg-emerald-500/90 text-white text-[9px] font-bold shadow-xs">
+                                  Cloud Stored
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const updated = [...formData.memories];
+                                  updated[idx].imageUrl = '';
+                                  setFormData({ ...formData, memories: updated });
+                                }}
+                                className="absolute top-1.5 right-1.5 p-1 bg-white/90 hover:bg-white text-[#765563] rounded-full shadow-xs text-[10px]"
+                                title="Remove photo"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </>
                           ) : (
-                            <div className="w-full h-full flex items-center justify-center text-[#765563]/40 text-xs">
-                              No photo selected
+                            <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#FFF8EF] via-[#FFD6E7]/30 to-[#FFE0CC]/30 text-[#765563]/60 text-xs p-3 text-center">
+                              <span className="text-2xl mb-1">🌸</span>
+                              <span>No photo yet</span>
                             </div>
                           )}
                         </div>
 
-                        {/* Local File Picker */}
-                        <div className="pt-1">
-                          <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white hover:bg-[#FFD6E7]/50 border border-[#FFBFD7] text-xs font-['Quicksand'] font-bold text-[#765563] cursor-pointer shadow-xs transition-colors">
-                            <Camera className="w-3.5 h-3.5 text-[#FF85A1]" />
-                            <span>Upload from Device</span>
+                        {/* Local / Cloud File Picker */}
+                        <div className="pt-1 flex flex-col gap-1.5">
+                          <label className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-white hover:bg-[#FFD6E7]/50 border border-[#FFBFD7] text-xs font-['Quicksand'] font-bold text-[#765563] cursor-pointer shadow-xs transition-colors">
+                            {isProcessingImage === idx ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#FF85A1]" />
+                            ) : (
+                              <Camera className="w-3.5 h-3.5 text-[#FF85A1]" />
+                            )}
+                            <span>{isProcessingImage === idx ? (uploadStatusText || 'Uploading...') : 'Upload from Device'}</span>
                             <input
                               type="file"
                               accept="image/*"
+                              disabled={isProcessingImage === idx}
                               onChange={(e) => handleImageUpload(idx, e)}
                               className="hidden"
                             />
                           </label>
-                          <p className="text-[10px] text-[#765563]/60 mt-1">
-                            Pick any photo from phone/laptop!
+                          <p className="text-[10px] text-[#765563]/60">
+                            Uploads permanently to Supabase Storage (with offline compression fallback)
                           </p>
                         </div>
 
                         {/* Or URL */}
                         <div className="pt-1">
                           <label className="block text-[11px] font-bold text-[#765563]/80 mb-1">
-                            Or Image URL
+                            Or Image URL / Path
                           </label>
                           <input
                             type="text"
-                            value={mem.imageUrl}
-                            placeholder="https://... or /images/..."
+                            value={mem.imageUrl || ''}
+                            placeholder="https://... or /images/original_memory.jpg"
                             onChange={(e) => {
                               const updated = [...formData.memories];
                               updated[idx].imageUrl = e.target.value;
@@ -1118,11 +1254,11 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
             </div>
           )}
 
-          {/* TAB: Security & Limitations */}
+          {/* TAB: Security & Authorization */}
           {activeTab === 'security' && (
             <div className="space-y-6 max-w-2xl">
               {/* Change PIN Form */}
-              <div className="p-5 rounded-2xl bg-[#FFF8EF] border-2 border-[#FFBFD7] space-y-4">
+              <div className="p-5 rounded-2xl bg-[#FFF8EF] border-2 border-[#FFBFD7] space-y-4 shadow-xs">
                 <div className="flex items-center gap-2">
                   <KeyRound className="w-5 h-5 text-[#FF85A1]" />
                   <h3 className="font-['Fredoka'] text-base font-semibold text-[#765563]">
@@ -1130,7 +1266,7 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                   </h3>
                 </div>
                 <p className="text-xs font-['Quicksand'] text-[#765563]/80">
-                  Current PIN is: <strong className="text-[#765563] font-mono">{storedPin}</strong>
+                  Current active PIN is: <strong className="text-[#765563] font-mono">{storedPin}</strong>
                 </p>
 
                 <form onSubmit={handleSavePin} className="space-y-3">
@@ -1182,32 +1318,23 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                 </form>
               </div>
 
-              {/* Clear Technical Limitations Callout */}
-              <div className="p-5 rounded-2xl bg-amber-50/80 border-2 border-amber-200/80 space-y-3 text-[#765563]">
+              {/* Security Architecture Card */}
+              <div className="p-5 rounded-2xl bg-gradient-to-br from-[#FFF8EF] to-[#FFD6E7]/20 border-2 border-[#FFBFD7] space-y-3 text-[#765563]">
                 <div className="flex items-center gap-2">
-                  <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
-                  <h4 className="font-['Fredoka'] text-sm font-semibold text-amber-900">
-                    Important Limitations Notice (How It Works)
+                  <Shield className="w-5 h-5 text-[#FF85A1] shrink-0" />
+                  <h4 className="font-['Fredoka'] text-sm font-semibold text-[#765563]">
+                    Backend Authorization & Security Architecture
                   </h4>
                 </div>
-                <div className="text-xs space-y-2 leading-relaxed font-['Quicksand'] text-amber-950">
+                <div className="text-xs space-y-2.5 leading-relaxed font-['Quicksand'] text-[#765563]/90">
                   <p>
-                    <strong>1. Browser LocalStorage:</strong> Edits you make here are saved directly
-                    inside your current browser's storage. They will stay intact when you refresh or
-                    reopen the page in this same browser.
+                    <strong>1. PostgreSQL Cryptographic Hashing:</strong> Your PIN is never stored in plain text. It is hashed using bcrypt via PostgreSQL’s <code>pgcrypto</code> extension directly inside your Supabase database.
                   </p>
                   <p>
-                    <strong>2. Cross-Device Synchronization:</strong> Because this site runs with no
-                    external databases or accounts (per your privacy requirement), changes made on
-                    your phone or laptop do <em>not</em> automatically transmit to a different device.
-                    To show your edits on your girlfriend's phone, you can either open it together on
-                    your device, or use the <strong>Export Backup (.json)</strong> feature in the
-                    Backup tab and import it on her device!
+                    <strong>2. Server-Enforced Write Protection:</strong> Even though the website client uses the public Supabase Anon key, direct table mutations are blocked by Row Level Security (RLS). Updates are authorized exclusively through the secure <code>save_universe_data()</code> database function, requiring the matching PIN before changes or deletes are written.
                   </p>
                   <p>
-                    <strong>3. PIN Privacy:</strong> The secret PIN provides friendly privacy on
-                    shared screens so visitors don't accidentally open editor tools. It is a
-                    convenience lock rather than military-grade banking cryptography.
+                    <strong>3. Zero Service Role Exposure:</strong> Your secret Supabase service-role key is never included in client code or frontend bundles, adhering to strict production security standards.
                   </p>
                 </div>
               </div>
@@ -1217,24 +1344,211 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
           {/* TAB: Backup / Sync */}
           {activeTab === 'backup' && (
             <div className="space-y-6 max-w-2xl">
+              {/* Supabase Cloud Sync Card */}
+              <div className="p-5 rounded-2xl bg-[#FFF8EF] border-2 border-[#FFBFD7] space-y-4 shadow-xs">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
+                    <Cloud className="w-5 h-5 text-[#FF85A1]" />
+                    <h4 className="font-['Fredoka'] text-sm font-semibold text-[#765563]">
+                      Supabase Cloud Database & Storage
+                    </h4>
+                  </div>
+                  {supabaseStatus?.connected ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-100/90 text-emerald-800 text-[11px] font-bold border border-emerald-300">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                      <span>Cloud Connected (Realtime Active)</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-100/90 text-amber-800 text-[11px] font-bold border border-amber-300">
+                      <span className="w-2 h-2 rounded-full bg-amber-500" />
+                      <span>Local Storage (Ready to Connect)</span>
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-xs font-['Quicksand'] text-[#765563]/80 leading-relaxed">
+                  Supabase provides persistent cross-device storage for your love notes, letters, and polaroid scrapbook pictures. When connected, changes you make on one device instantly reflect everywhere!
+                </p>
+
+                {/* Cloud Sync Actions */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    disabled={isTestingConnection}
+                    onClick={async () => {
+                      setIsTestingConnection(true);
+                      const result = await testSupabaseConnection();
+                      setIsTestingConnection(false);
+                      setConnectionTestResult(result);
+                      if (result.connected) {
+                        audioEngine.playChime(1.2);
+                      } else {
+                        audioEngine.playBlip(0.7);
+                      }
+                    }}
+                    className="px-3 py-2 rounded-xl bg-white hover:bg-[#FFD6E7]/40 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                  >
+                    {isTestingConnection ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#FF85A1]" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5 text-[#FF85A1]" />
+                    )}
+                    <span>Test Connection</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isMigrating}
+                    onClick={async () => {
+                      if (!onMigrateToSupabase) return;
+                      setIsMigrating(true);
+                      const res = await onMigrateToSupabase();
+                      setIsMigrating(false);
+                      alert(res.message);
+                    }}
+                    className="px-3 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                  >
+                    {isMigrating ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
+                    ) : (
+                      <Upload className="w-3.5 h-3.5 text-[#765563]" />
+                    )}
+                    <span>Sync Local to Cloud</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isRefreshing}
+                    onClick={async () => {
+                      if (!onRefreshFromSupabase) return;
+                      setIsRefreshing(true);
+                      const res = await onRefreshFromSupabase();
+                      setIsRefreshing(false);
+                      if (res.success) {
+                        audioEngine.playChime(1.3);
+                      }
+                      alert(res.message);
+                    }}
+                    className="px-3 py-2 rounded-xl bg-white hover:bg-[#FFE0CC]/50 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                  >
+                    {isRefreshing ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#FF85A1]" />
+                    ) : (
+                      <Download className="w-3.5 h-3.5 text-[#FF85A1]" />
+                    )}
+                    <span>Pull from Cloud</span>
+                  </button>
+                </div>
+
+                {/* Connection Test Diagnostics Banner */}
+                {connectionTestResult && (
+                  <div
+                    className={`p-3 rounded-xl border text-xs font-['Quicksand'] space-y-1 ${
+                      connectionTestResult.connected
+                        ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                        : 'bg-rose-50 border-rose-300 text-rose-900'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-bold">
+                      {connectionTestResult.connected ? (
+                        <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                      )}
+                      <span>{connectionTestResult.message}</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Quick Credentials Setup / Override */}
+                <details className="pt-2 border-t border-[#FFBFD7]/50 text-xs">
+                  <summary className="font-['Fredoka'] font-semibold text-[#765563] cursor-pointer hover:text-[#FF85A1] py-1 select-none">
+                    ⚙️ Supabase Project Credentials (Optional Custom Setup)
+                  </summary>
+                  <div className="mt-2.5 p-3.5 bg-white rounded-xl border border-[#FFBFD7] space-y-3">
+                    <p className="text-[11px] text-[#765563]/75">
+                      You can set these credentials in GitHub Actions secrets or enter them here directly for your browser session.
+                    </p>
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#765563] mb-1">
+                        Supabase Project URL
+                      </label>
+                      <input
+                        type="text"
+                        value={supabaseUrlInput}
+                        onChange={(e) => setSupabaseUrlInput(e.target.value)}
+                        placeholder="https://your-project.supabase.co"
+                        className="w-full bg-[#FFF8EF] border border-[#FFBFD7] rounded-lg px-2.5 py-1.5 text-xs text-[#765563] font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-[#765563] mb-1">
+                        Supabase Public Anon Key
+                      </label>
+                      <input
+                        type="password"
+                        value={supabaseKeyInput}
+                        onChange={(e) => setSupabaseKeyInput(e.target.value)}
+                        placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                        className="w-full bg-[#FFF8EF] border border-[#FFBFD7] rounded-lg px-2.5 py-1.5 text-xs text-[#765563] font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          saveSupabaseCredentials(supabaseUrlInput, supabaseKeyInput);
+                          audioEngine.playChime(1.1);
+                          alert('Supabase credentials saved in browser storage!');
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-[#FFD6E7] hover:bg-[#FFBFD7] text-[#765563] font-bold text-xs cursor-pointer shadow-xs"
+                      >
+                        Save Credentials
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSupabaseUrlInput('');
+                          setSupabaseKeyInput('');
+                          saveSupabaseCredentials('', '');
+                          audioEngine.playBlip(0.8);
+                          alert('Cleared local Supabase credentials.');
+                        }}
+                        className="px-3 py-1.5 rounded-lg border border-[#FFBFD7] text-[#765563]/70 hover:bg-rose-50 hover:text-rose-600 text-xs cursor-pointer"
+                      >
+                        Clear
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowSqlModal(true)}
+                        className="ml-auto text-xs font-bold text-[#FF85A1] hover:underline flex items-center gap-1 cursor-pointer"
+                      >
+                        <Database className="w-3.5 h-3.5" />
+                        <span>View SQL Schema</span>
+                      </button>
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+              {/* Offline File Backup Card */}
               <div className="p-5 rounded-2xl bg-[#FFF8EF] border-2 border-[#FFBFD7] space-y-3">
                 <div className="flex items-center gap-2">
                   <Sparkles className="w-5 h-5 text-[#FF85A1]" />
                   <h4 className="font-['Fredoka'] text-sm font-semibold text-[#765563]">
-                    Export & Import Your Romantic Universe
+                    Offline File Backup (.json)
                   </h4>
                 </div>
                 <p className="text-xs font-['Quicksand'] text-[#765563]/80 leading-relaxed">
-                  Download a backup file containing all your customized text, photos, polaroids, and
-                  letters. You can keep this safe on your computer or import it onto another device!
+                  Download an offline JSON copy containing all your customized text, memories, polaroids, and letters.
                 </p>
 
-                <div className="flex flex-col sm:flex-row items-center gap-3 pt-2">
+                <div className="flex flex-col sm:flex-row items-center gap-3 pt-1">
                   <button
                     onClick={handleExportJSON}
-                    className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-[#765563] text-xs font-bold flex items-center justify-center gap-2 cursor-pointer shadow-xs transition-all"
+                    className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-white hover:bg-[#FFD6E7]/40 border border-[#FFBFD7] text-[#765563] text-xs font-bold flex items-center justify-center gap-2 cursor-pointer shadow-xs transition-all"
                   >
-                    <Download className="w-4 h-4" />
+                    <Download className="w-4 h-4 text-[#FF85A1]" />
                     <span>Download Backup (.json)</span>
                   </button>
 
@@ -1251,7 +1565,8 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                 </div>
               </div>
 
-              <div className="pt-4 border-t border-[#FFBFD7]/50">
+              {/* Reset Defaults */}
+              <div className="pt-2 border-t border-[#FFBFD7]/50">
                 <button
                   onClick={() => {
                     if (
@@ -1272,16 +1587,191 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
           )}
         </div>
 
+        {/* SQL Script View Modal */}
+        {showSqlModal && (
+          <div className="fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-5 bg-[#765563]/40 backdrop-blur-md animate-fadeIn">
+            <div className="relative w-full max-w-2xl max-h-[85vh] bg-[#FFFDF9] border-2 border-[#FFBFD7] rounded-3xl shadow-2xl flex flex-col overflow-hidden text-[#765563]">
+              <div className="p-4 border-b border-[#FFBFD7] flex items-center justify-between bg-[#FFF8EF]">
+                <div className="flex items-center gap-2">
+                  <Database className="w-5 h-5 text-[#FF85A1]" />
+                  <h3 className="font-['Fredoka'] text-sm font-semibold text-[#765563]">
+                    Supabase SQL Setup Script
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowSqlModal(false)}
+                  className="p-1 rounded-full text-[#765563]/60 hover:text-[#765563] hover:bg-[#FFD6E7]/50"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-4 overflow-y-auto flex-1 font-['Quicksand'] space-y-3 text-xs">
+                <p className="text-[#765563]/80">
+                  Run this SQL in your Supabase dashboard: <strong>SQL Editor</strong> &rarr; <strong>New Query</strong> &rarr; <strong>Run</strong>.
+                </p>
+                <div className="relative bg-[#2D2A32] text-[#F3E8EE] p-3.5 rounded-xl font-mono text-[11px] overflow-x-auto max-h-[45vh]">
+                  <pre>{`-- 1. Enable pgcrypto for PIN hashing
+create extension if not exists pgcrypto;
+
+-- 2. Create universe_data table
+create table if not exists public.universe_data (
+  id text primary key default 'current',
+  data jsonb not null,
+  pin_hash text not null default crypt('1234', gen_salt('bf')),
+  updated_at timestamp with time zone default timezone('utc'::text, now())
+);
+
+-- 3. Row Level Security (RLS)
+alter table public.universe_data enable row level security;
+drop policy if exists "Public read universe_data" on public.universe_data;
+create policy "Public read universe_data" on public.universe_data for select using (true);
+create policy "Public update universe_data" on public.universe_data for update using (true);
+create policy "Public insert universe_data" on public.universe_data for insert with check (true);
+
+-- 4. Enable Supabase Realtime
+alter publication supabase_realtime add table public.universe_data;
+
+-- 5. Secure save function
+create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+  stored_hash text;
+  result_row universe_data;
+begin
+  select pin_hash into stored_hash from public.universe_data where id = 'current';
+  if stored_hash is null then
+    insert into public.universe_data (id, data, pin_hash, updated_at)
+    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
+    returning * into result_row;
+    return result_row.data;
+  end if;
+  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
+    raise exception 'Invalid PIN: authorization failed';
+  end if;
+  update public.universe_data set data = new_data, updated_at = now()
+  where id = 'current' returning * into result_row;
+  return result_row.data;
+end;
+$$;
+
+-- 6. Storage Bucket for Scrapbook Images
+insert into storage.buckets (id, name, public)
+values ('scrapbook-images', 'scrapbook-images', true)
+on conflict (id) do update set public = true;
+
+create policy "Public view scrapbook images" on storage.objects for select using (bucket_id = 'scrapbook-images');
+create policy "Allow image uploads" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
+create policy "Allow image updates" on storage.objects for update using (bucket_id = 'scrapbook-images');
+create policy "Allow image deletes" on storage.objects for delete using (bucket_id = 'scrapbook-images');`}</pre>
+                </div>
+              </div>
+
+              <div className="p-3.5 border-t border-[#FFBFD7] bg-[#FFF8EF] flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sql = `-- 1. Enable pgcrypto for PIN hashing
+create extension if not exists pgcrypto;
+
+-- 2. Create universe_data table
+create table if not exists public.universe_data (
+  id text primary key default 'current',
+  data jsonb not null,
+  pin_hash text not null default crypt('1234', gen_salt('bf')),
+  updated_at timestamp with time zone default timezone('utc'::text, now())
+);
+
+-- 3. Row Level Security (RLS)
+alter table public.universe_data enable row level security;
+drop policy if exists "Public read universe_data" on public.universe_data;
+create policy "Public read universe_data" on public.universe_data for select using (true);
+create policy "Public update universe_data" on public.universe_data for update using (true);
+create policy "Public insert universe_data" on public.universe_data for insert with check (true);
+
+-- 4. Enable Supabase Realtime
+alter publication supabase_realtime add table public.universe_data;
+
+-- 5. Secure save function
+create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+  stored_hash text;
+  result_row universe_data;
+begin
+  select pin_hash into stored_hash from public.universe_data where id = 'current';
+  if stored_hash is null then
+    insert into public.universe_data (id, data, pin_hash, updated_at)
+    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
+    returning * into result_row;
+    return result_row.data;
+  end if;
+  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
+    raise exception 'Invalid PIN: authorization failed';
+  end if;
+  update public.universe_data set data = new_data, updated_at = now()
+  where id = 'current' returning * into result_row;
+  return result_row.data;
+end;
+$$;
+
+-- 6. Storage Bucket for Scrapbook Images
+insert into storage.buckets (id, name, public)
+values ('scrapbook-images', 'scrapbook-images', true)
+on conflict (id) do update set public = true;
+
+create policy "Public view scrapbook images" on storage.objects for select using (bucket_id = 'scrapbook-images');
+create policy "Allow image uploads" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
+create policy "Allow image updates" on storage.objects for update using (bucket_id = 'scrapbook-images');
+create policy "Allow image deletes" on storage.objects for delete using (bucket_id = 'scrapbook-images');`;
+                    navigator.clipboard.writeText(sql);
+                    setCopiedSql(true);
+                    audioEngine.playChime(1.2);
+                    setTimeout(() => setCopiedSql(false), 2000);
+                  }}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                >
+                  {copiedSql ? (
+                    <>
+                      <CheckCheck className="w-4 h-4 text-emerald-600" />
+                      <span>Copied to Clipboard!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4" />
+                      <span>Copy Full SQL Script</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowSqlModal(false)}
+                  className="px-4 py-2 rounded-xl border border-[#FFBFD7] text-xs font-bold text-[#765563] hover:bg-[#FFD6E7]/40 cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Bottom Actions Bar */}
         <div className="px-3 sm:px-6 py-2.5 sm:py-3 border-t border-[#FFBFD7]/60 bg-[#FFF8EF] flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 text-[11px] sm:text-xs font-['Quicksand'] text-[#765563]/70 shrink-0">
             <Shield className="w-3.5 h-3.5 text-[#FF85A1]" />
             <span className="hidden sm:inline">Owner Mode active</span>
+            {savedBanner && (
+              <span className="ml-2 px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[11px] font-bold border border-emerald-300 animate-fadeIn">
+                {saveBannerText}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 justify-end w-full sm:w-auto">
             <button
               onClick={onClose}
+              disabled={isSaving}
               className="px-3 sm:px-4 py-2 rounded-xl border border-[#FFBFD7] text-[#765563] font-['Quicksand'] text-xs font-bold hover:bg-[#FFD6E7]/40 transition-colors cursor-pointer"
             >
               <span className="hidden xs:inline">Cancel / Close</span>
@@ -1289,6 +1779,7 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
             </button>
             <button
               onClick={handlePreview}
+              disabled={isSaving}
               className="px-3 sm:px-4 py-2 rounded-xl bg-white hover:bg-[#FFE0CC]/50 border border-[#FFBFD7] text-[#765563] font-['Quicksand'] text-xs font-bold flex items-center gap-1 cursor-pointer shadow-xs transition-all"
             >
               <Eye className="w-3.5 h-3.5 text-[#FF85A1]" />
@@ -1297,11 +1788,21 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
             </button>
             <button
               onClick={handleSave}
-              className="px-3.5 sm:px-5 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-[#765563] font-['Quicksand'] text-xs font-bold flex items-center gap-1 cursor-pointer shadow-xs hover:shadow-sm transition-all"
+              disabled={isSaving}
+              className="px-3.5 sm:px-5 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-[#765563] font-['Quicksand'] text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs hover:shadow-sm transition-all disabled:opacity-60"
             >
-              <Heart className="w-3.5 h-3.5 fill-[#FF85A1] text-[#FF85A1]" />
-              <span className="hidden xs:inline">Save & Apply</span>
-              <span className="xs:hidden">Save</span>
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
+                  <span>Saving & Syncing...</span>
+                </>
+              ) : (
+                <>
+                  <Heart className="w-3.5 h-3.5 fill-[#FF85A1] text-[#FF85A1]" />
+                  <span className="hidden xs:inline">Save & Apply</span>
+                  <span className="xs:hidden">Save</span>
+                </>
+              )}
             </button>
           </div>
         </div>

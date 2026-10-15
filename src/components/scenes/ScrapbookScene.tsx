@@ -11,6 +11,7 @@ interface ScrapbookSceneProps {
 
 export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext }) => {
   const [selectedMemory, setSelectedMemory] = useState<MemoryItem | null>(null);
+  const [failedImages, setFailedImages] = useState<Record<string, boolean>>({});
 
   const handleOpenDetail = (mem: MemoryItem) => {
     audioEngine.playPaperRustle();
@@ -20,6 +21,115 @@ export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext
 
   const handleCloseDetail = () => {
     setSelectedMemory(null);
+  };
+
+  const renderMemoryVisual = (mem: MemoryItem, isModal = false) => {
+    const hasValidImage = Boolean(mem.imageUrl && !failedImages[mem.id]);
+
+    if (hasValidImage) {
+      return (
+        <img
+          src={resolveAssetUrl(mem.imageUrl)}
+          alt={mem.title}
+          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700"
+          onError={() => {
+            setFailedImages((prev) => ({ ...prev, [mem.id]: true }));
+          }}
+        />
+      );
+    }
+
+    // Handcrafted aesthetic romantic theme illustrations based on memory content
+    if (mem.id === 'mem-1' || mem.title.toLowerCase().includes('central')) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#FFE0CC] via-[#FFF8EF] to-[#FFD6E7] p-4 text-center select-none">
+          <span className="text-3xl sm:text-4xl mb-1.5 animate-gentle-bounce">📍</span>
+          <span className="text-base sm:text-lg font-['Fredoka'] text-[#765563] font-semibold">
+            Central · 4:30 PM
+          </span>
+          <span className="text-[11px] text-[#FF85A1] font-['Quicksand'] font-bold mt-1 tracking-wider uppercase">
+            The Spark Begun ✨
+          </span>
+        </div>
+      );
+    }
+
+    if (
+      mem.id === 'mem-2' ||
+      mem.title.toLowerCase().includes('infatuation') ||
+      mem.title.toLowerCase().includes('late-night')
+    ) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#E9DFFF] via-[#FFF8EF] to-[#DDF1FF] p-4 text-center select-none">
+          <div className="flex items-center gap-2 mb-1.5 text-2xl sm:text-3xl">
+            <span className="animate-gentle-bounce">🌙</span>
+            <span className="text-sm">✨</span>
+            <span className="animate-gentle-bounce">⭐</span>
+          </div>
+          <span className="text-base sm:text-lg font-['Fredoka'] text-[#765563] font-semibold">
+            Under Quiet Stars
+          </span>
+          <span className="text-[11px] text-[#A78BFA] font-['Quicksand'] font-bold mt-1 tracking-wider uppercase">
+            Endless Late-Night Talks ♡
+          </span>
+        </div>
+      );
+    }
+
+    if (
+      mem.id === 'mem-3' ||
+      mem.title.toLowerCase().includes('storm') ||
+      mem.title.toLowerCase().includes('stronger')
+    ) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#DDF1FF] via-[#FFF8EF] to-[#DFF4E4] p-4 text-center select-none">
+          <div className="flex items-center gap-2 mb-1.5 text-2xl sm:text-3xl">
+            <span className="animate-gentle-bounce">🌈</span>
+            <span className="text-xl">🌸</span>
+          </div>
+          <span className="text-base sm:text-lg font-['Fredoka'] text-[#765563] font-semibold">
+            Through Every Storm
+          </span>
+          <span className="text-[11px] text-[#34D399] font-['Quicksand'] font-bold mt-1 tracking-wider uppercase">
+            Unbreakable Bond 🎀
+          </span>
+        </div>
+      );
+    }
+
+    if (
+      mem.id === 'mem-4' ||
+      mem.title.toLowerCase().includes('hug') ||
+      mem.title.toLowerCase().includes('comfort')
+    ) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#FFD6E7] via-[#FFF8EF] to-[#FFE0CC] p-4 text-center select-none">
+          <div className="flex items-center gap-2 mb-1.5 text-2xl sm:text-3xl">
+            <span className="animate-gentle-bounce">🧸</span>
+            <span className="text-xl">💕</span>
+          </div>
+          <span className="text-base sm:text-lg font-['Fredoka'] text-[#765563] font-semibold">
+            Safe In My Arms
+          </span>
+          <span className="text-[11px] text-[#FF85A1] font-['Quicksand'] font-bold mt-1 tracking-wider uppercase">
+            Sacred Comfort & Hugs ♡
+          </span>
+        </div>
+      );
+    }
+
+    // Default custom memory illustration
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#FFF8EF] via-[#FFD6E7]/50 to-[#FFE0CC]/40 p-4 text-center select-none">
+        <span className="text-3xl mb-1.5 animate-gentle-bounce">🌸</span>
+        <span className="text-base font-['Fredoka'] text-[#765563] font-semibold">
+          {mem.title}
+        </span>
+        <span className="text-[11px] text-[#FF85A1] font-['Quicksand'] font-bold mt-1 tracking-wider uppercase">
+          Cherished Memory
+        </span>
+      </div>
+    );
   };
 
   // Cute washi tape patterns for scrapbook cards
@@ -127,26 +237,7 @@ export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext
 
                         {/* Photo Container */}
                         <div className="relative aspect-[4/3] w-full rounded-xl overflow-hidden bg-[#FFE0CC]/30 border border-[#FFBFD7]/70 shadow-inner mt-1">
-                          {mem.imageUrl ? (
-                            <img
-                              src={resolveAssetUrl(mem.imageUrl)}
-                              alt={mem.title}
-                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700"
-                              onError={(e) => {
-                                (e.target as HTMLElement).style.display = 'none';
-                              }}
-                            />
-                          ) : (
-                            <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-[#FFF8EF] via-[#FFD6E7]/50 to-[#FFE0CC]/40 p-6 text-center">
-                              <span className="text-3xl mb-1">🌸</span>
-                              <span className="text-base font-['Fredoka'] text-[#765563]">
-                                {mem.title}
-                              </span>
-                              <span className="text-xs text-[#FF85A1] font-['Quicksand'] font-bold mt-1">
-                                Cherished Memory
-                              </span>
-                            </div>
-                          )}
+                          {renderMemoryVisual(mem, false)}
 
                           {/* Subtle warm sunlight sheen */}
                           <div className="absolute inset-0 bg-gradient-to-tr from-[#FFE0CC]/20 via-transparent to-[#FFD6E7]/20 pointer-events-none" />
@@ -207,16 +298,11 @@ export const ScrapbookScene: React.FC<ScrapbookSceneProps> = ({ memories, onNext
               <X className="w-5 h-5" />
             </button>
 
-            {/* Photo Preview */}
-            {selectedMemory.imageUrl && (
-              <div className="mb-4 sm:mb-5 rounded-2xl overflow-hidden aspect-[16/9] border-2 border-[#FFBFD7]/60 shadow-sm bg-[#FFE0CC]/30">
-                <img
-                  src={resolveAssetUrl(selectedMemory.imageUrl)}
-                  alt={selectedMemory.title}
-                  className="w-full h-full object-cover"
-                />
-              </div>
-            )}
+            {/* Photo Preview in Modal */}
+            <div className="mb-4 sm:mb-5 rounded-2xl overflow-hidden aspect-[16/9] border-2 border-[#FFBFD7]/60 shadow-sm bg-[#FFE0CC]/30 relative">
+              {renderMemoryVisual(selectedMemory, true)}
+              <div className="absolute inset-0 bg-gradient-to-tr from-[#FFE0CC]/15 via-transparent to-[#FFD6E7]/15 pointer-events-none" />
+            </div>
 
             <div className="flex items-center gap-1.5 sm:gap-2 mb-1.5 sm:mb-2">
               <span className="text-xs sm:text-sm">🌸</span>

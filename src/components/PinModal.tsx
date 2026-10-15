@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Lock, Heart, X, Eye, EyeOff, Sparkles, KeyRound } from 'lucide-react';
+import { Lock, Heart, X, Eye, EyeOff, Sparkles, KeyRound, Loader2 } from 'lucide-react';
 import { audioEngine } from '../utils/audio';
+import { getSupabase } from '../utils/supabase';
 
 interface PinModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (verifiedPin: string) => void;
   storedPin: string;
 }
 
@@ -19,6 +20,7 @@ export const PinModal: React.FC<PinModalProps> = ({
   const [showPin, setShowPin] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [isShaking, setIsShaking] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -26,6 +28,7 @@ export const PinModal: React.FC<PinModalProps> = ({
       setPinInput('');
       setErrorMsg('');
       setIsShaking(false);
+      setIsVerifying(false);
       setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
@@ -34,22 +37,45 @@ export const PinModal: React.FC<PinModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!pinInput.trim()) {
+    const pin = pinInput.trim();
+    if (!pin) {
       setErrorMsg('Please enter your PIN');
       return;
     }
 
-    if (pinInput.trim() === storedPin) {
+    setIsVerifying(true);
+
+    // 1. First check local PIN
+    if (pin === storedPin) {
       audioEngine.playChime(1.2);
-      onSuccess();
-    } else {
-      audioEngine.playBlip(0.6);
-      setErrorMsg('Incorrect PIN. Please try again ♡');
-      setIsShaking(true);
-      setTimeout(() => setIsShaking(false), 500);
+      setIsVerifying(false);
+      onSuccess(pin);
+      return;
     }
+
+    // 2. Also check with Supabase RPC verify_owner_pin if backend is configured
+    try {
+      const supabase = getSupabase();
+      if (supabase) {
+        const { data: isValid, error } = await supabase.rpc('verify_owner_pin', { check_pin: pin });
+        if (!error && isValid === true) {
+          audioEngine.playChime(1.2);
+          setIsVerifying(false);
+          onSuccess(pin);
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn('Backend PIN verification check error:', err);
+    }
+
+    setIsVerifying(false);
+    audioEngine.playBlip(0.6);
+    setErrorMsg('Incorrect PIN. Please try again ♡');
+    setIsShaking(true);
+    setTimeout(() => setIsShaking(false), 500);
   };
 
   return (
@@ -126,10 +152,20 @@ export const PinModal: React.FC<PinModalProps> = ({
             </button>
             <button
               type="submit"
-              className="flex-1 py-2 sm:py-2.5 px-3 sm:px-4 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] text-[#765563] text-xs font-['Quicksand'] font-bold shadow-xs hover:shadow-sm border border-[#FFA3BA] transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+              disabled={isVerifying}
+              className="flex-1 py-2 sm:py-2.5 px-3 sm:px-4 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] text-[#765563] text-xs font-['Quicksand'] font-bold shadow-xs hover:shadow-sm border border-[#FFA3BA] transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
             >
-              <Heart className="w-3.5 h-3.5 fill-[#FF85A1] text-[#FF85A1]" />
-              <span>Unlock Editor</span>
+              {isVerifying ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
+                  <span>Verifying...</span>
+                </>
+              ) : (
+                <>
+                  <Heart className="w-3.5 h-3.5 fill-[#FF85A1] text-[#FF85A1]" />
+                  <span>Unlock Editor</span>
+                </>
+              )}
             </button>
           </div>
         </form>

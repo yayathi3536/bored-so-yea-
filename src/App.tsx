@@ -19,7 +19,15 @@ import { TreasureBoxScene } from './components/scenes/TreasureBoxScene';
 import { FinalScene } from './components/scenes/FinalScene';
 import { CuteBunny } from './components/CuteBunny';
 import { audioEngine } from './utils/audio';
-import { Sparkles, Edit3, Check, X, Shield } from 'lucide-react';
+import { Sparkles, Edit3, Check, X, Shield, Cloud, RefreshCw, CheckCircle2 } from 'lucide-react';
+import {
+  fetchUniverseFromSupabase,
+  saveUniverseToSupabase,
+  updateOwnerPinOnSupabase,
+  subscribeToUniverseChanges,
+  getSupabaseCredentials,
+  testSupabaseConnection,
+} from './utils/supabase';
 
 const STORAGE_KEY = 'our_universe_data_v1';
 const PIN_STORAGE_KEY = 'romantic_owner_pin_v1';
@@ -33,8 +41,17 @@ export default function App() {
         const parsed = JSON.parse(saved);
         // Force update soundtrack to the user's requested Heat Waves song
         parsed.soundtrack = DEFAULT_UNIVERSE.soundtrack;
-        if (parsed.memories?.[0] && (!parsed.memories[0].imageUrl || parsed.memories[0].imageUrl.includes('/src/assets/'))) {
-          parsed.memories[0].imageUrl = '/images/original_memory.jpg';
+        if (Array.isArray(parsed.memories)) {
+          parsed.memories = parsed.memories.map((m: any, idx: number) => {
+            if (idx === 0 && (!m.imageUrl || m.imageUrl.includes('/src/assets/') || m.imageUrl.includes('1000080965.jpg'))) {
+              return { ...m, imageUrl: '/images/original_memory.jpg' };
+            }
+            if (typeof m.imageUrl === 'string') {
+              const cleaned = m.imageUrl.replace(/^\/bored-so-yea-\//, '/');
+              return { ...m, imageUrl: cleaned };
+            }
+            return m;
+          });
         }
         return { ...DEFAULT_UNIVERSE, ...parsed };
       }
@@ -52,11 +69,40 @@ export default function App() {
     }
   });
 
+  const [currentOwnerPin, setCurrentOwnerPin] = useState<string>(() => {
+    try {
+      return localStorage.getItem(PIN_STORAGE_KEY) || DEFAULT_PIN;
+    } catch {
+      return DEFAULT_PIN;
+    }
+  });
+
   const [currentScene, setCurrentScene] = useState<SceneId>('opening');
   const [isPinModalOpen, setIsPinModalOpen] = useState(false);
   const [isOwnerModeOpen, setIsOwnerModeOpen] = useState(false);
   const [previewData, setPreviewData] = useState<UniverseData | null>(null);
   const [isPreviewActive, setIsPreviewActive] = useState(false);
+
+  // Cloud status and notification toast
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [toastNotification, setToastNotification] = useState<{
+    message: string;
+    type: 'success' | 'info' | 'error';
+  } | null>(null);
+  const [supabaseStatus, setSupabaseStatus] = useState<{
+    connected: boolean;
+    tableFound: boolean;
+    storageFound: boolean;
+    source: 'env' | 'local' | 'none';
+  }>({ connected: false, tableFound: false, storageFound: false, source: 'none' });
+
+  // Show cute pastel toast message
+  const showToast = (message: string, type: 'success' | 'info' | 'error' = 'info') => {
+    setToastNotification({ message, type });
+    setTimeout(() => {
+      setToastNotification((curr) => (curr?.message === message ? null : curr));
+    }, 4500);
+  };
 
   // Discreet flower clicks counter
   const [flowerClicks, setFlowerClicks] = useState(0);
@@ -64,6 +110,71 @@ export default function App() {
 
   // Active dataset: uses previewData when in preview mode, else saved data
   const activeData = isPreviewActive && previewData ? previewData : data;
+
+  // Supabase Initial Fetch, Auto-Seed, and Realtime Subscription
+  useEffect(() => {
+    let isMounted = true;
+
+    const initCloud = async () => {
+      const creds = getSupabaseCredentials();
+      if (!isMounted) return;
+      setSupabaseStatus((prev) => ({ ...prev, source: creds.source }));
+
+      if (creds.source !== 'none') {
+        setCloudSyncStatus('syncing');
+        try {
+          const testRes = await testSupabaseConnection();
+          if (!isMounted) return;
+          setSupabaseStatus({
+            connected: testRes.connected,
+            tableFound: testRes.tableFound,
+            storageFound: testRes.storageFound,
+            source: creds.source,
+          });
+
+          // Fetch cloud data
+          const { data: cloudData, error } = await fetchUniverseFromSupabase();
+          if (!isMounted) return;
+
+          if (cloudData) {
+            setData(cloudData);
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
+            } catch {}
+            setCloudSyncStatus('synced');
+          } else if (!error && testRes.tableFound) {
+            // Table exists but is empty: automatically seed with current data
+            console.log('Seeding initial website data to Supabase database...');
+            await saveUniverseToSupabase(data, storedPin);
+            setCloudSyncStatus('synced');
+          } else {
+            setCloudSyncStatus(testRes.connected ? 'synced' : 'error');
+          }
+        } catch (err) {
+          console.warn('Supabase initialization notice:', err);
+          if (isMounted) setCloudSyncStatus('error');
+        }
+      }
+    };
+
+    initCloud();
+
+    // Supabase Realtime channel subscription
+    const unsubscribe = subscribeToUniverseChanges((newData) => {
+      if (!isMounted) return;
+      setData(newData);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
+      } catch {}
+      audioEngine.playBlip(1.2);
+      showToast('✨ Updated from another device in real-time!', 'success');
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Keyboard shortcut Shift + O or Shift + E to trigger PIN modal for owner convenience
   useEffect(() => {
@@ -97,29 +208,74 @@ export default function App() {
   };
 
   // When PIN entry is verified
-  const handlePinSuccess = () => {
+  const handlePinSuccess = (verifiedPin: string) => {
+    setCurrentOwnerPin(verifiedPin);
     setIsPinModalOpen(false);
     setIsOwnerModeOpen(true);
   };
 
   // Update Owner PIN
-  const handleUpdatePin = (newPin: string) => {
+  const handleUpdatePin = async (newPin: string): Promise<{ success: boolean; message: string }> => {
     setStoredPin(newPin);
+    setCurrentOwnerPin(newPin);
     try {
       localStorage.setItem(PIN_STORAGE_KEY, newPin);
     } catch {}
+
+    const result = await updateOwnerPinOnSupabase(currentOwnerPin || storedPin, newPin);
+    return result;
   };
 
-  // Save changes to localStorage and main state
-  const handleSaveData = (newData: UniverseData) => {
+  // Save changes to localStorage and Supabase Cloud
+  const handleSaveData = async (newData: UniverseData): Promise<{ success: boolean; message: string }> => {
     setData(newData);
     setPreviewData(null);
     setIsPreviewActive(false);
+
+    // Save to local cache first
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
-    } catch {
-      // storage quota or incognito
+    } catch (err) {
+      console.warn('LocalStorage save quota notice:', err);
     }
+
+    // Save to Supabase Cloud with verified PIN
+    const pinToUse = currentOwnerPin || storedPin;
+    const result = await saveUniverseToSupabase(newData, pinToUse);
+
+    if (result.success) {
+      setCloudSyncStatus('synced');
+      showToast(result.message, 'success');
+    } else {
+      showToast(result.message, 'info');
+    }
+
+    return result;
+  };
+
+  // Manually push local edits to Supabase
+  const handleMigrateToSupabase = async (): Promise<{ success: boolean; message: string }> => {
+    const pinToUse = currentOwnerPin || storedPin;
+    const result = await saveUniverseToSupabase(data, pinToUse);
+    if (result.success) {
+      setCloudSyncStatus('synced');
+      showToast('✨ All local customizations successfully synced to Supabase!', 'success');
+    }
+    return result;
+  };
+
+  // Manually pull latest from Supabase
+  const handleRefreshFromSupabase = async (): Promise<{ success: boolean; message: string }> => {
+    const { data: remoteData, error } = await fetchUniverseFromSupabase();
+    if (remoteData) {
+      setData(remoteData);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(remoteData));
+      } catch {}
+      setCloudSyncStatus('synced');
+      return { success: true, message: 'Loaded latest cloud data from Supabase!' };
+    }
+    return { success: false, message: error || 'No cloud data found on Supabase.' };
   };
 
   // Live preview mode without saving permanently yet
@@ -310,6 +466,25 @@ export default function App() {
         )}
       </footer>
 
+      {/* Realtime Toast Notification */}
+      {toastNotification && (
+        <aside
+          aria-label="Cloud sync notification"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-sm w-[calc(100%-2rem)] bg-[#FFFDF9]/95 backdrop-blur-md border-2 border-[#FFBFD7] shadow-xl px-4 py-2.5 rounded-2xl flex items-center gap-2.5 animate-fadeIn text-[#765563]"
+        >
+          <Sparkles className="w-4 h-4 text-[#FF85A1] shrink-0" />
+          <span className="text-xs font-['Quicksand'] font-semibold flex-1">
+            {toastNotification.message}
+          </span>
+          <button
+            onClick={() => setToastNotification(null)}
+            className="p-1 text-[#765563]/60 hover:text-[#765563] cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </aside>
+      )}
+
       {/* PIN Verification Modal */}
       <PinModal
         isOpen={isPinModalOpen}
@@ -327,7 +502,11 @@ export default function App() {
         onPreview={handlePreview}
         onReset={handleResetData}
         storedPin={storedPin}
+        currentVerifiedPin={currentOwnerPin}
         onUpdatePin={handleUpdatePin}
+        onMigrateToSupabase={handleMigrateToSupabase}
+        onRefreshFromSupabase={handleRefreshFromSupabase}
+        supabaseStatus={supabaseStatus}
       />
     </div>
   );

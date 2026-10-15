@@ -37,32 +37,8 @@ const PIN_STORAGE_KEY = 'romantic_owner_pin_v1';
 const DEFAULT_PIN = '1234';
 
 export default function App() {
-  const [data, setData] = useState<UniverseData>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        // Force update soundtrack to the user's requested Heat Waves song
-        parsed.soundtrack = DEFAULT_UNIVERSE.soundtrack;
-        if (Array.isArray(parsed.memories)) {
-          parsed.memories = parsed.memories.map((m: any, idx: number) => {
-            if (idx === 0 && (!m.imageUrl || m.imageUrl.includes('/src/assets/') || m.imageUrl.includes('1000080965.jpg'))) {
-              return { ...m, imageUrl: '/images/original_memory.jpg' };
-            }
-            if (typeof m.imageUrl === 'string') {
-              const cleaned = m.imageUrl.replace(/^\/bored-so-yea-\//, '/');
-              return { ...m, imageUrl: cleaned };
-            }
-            return m;
-          });
-        }
-        return { ...DEFAULT_UNIVERSE, ...parsed };
-      }
-    } catch {
-      // Fallback
-    }
-    return DEFAULT_UNIVERSE;
-  });
+  const [data, setData] = useState<UniverseData>(DEFAULT_UNIVERSE);
+  const [cloudInitComplete, setCloudInitComplete] = useState(false);
 
   const [storedPin, setStoredPin] = useState<string>(() => {
     try {
@@ -114,17 +90,20 @@ export default function App() {
   // Active dataset: uses previewData when in preview mode, else saved data
   const activeData = isPreviewActive && previewData ? previewData : data;
 
+  const showCloudLoading = !cloudInitComplete && cloudSyncStatus === 'syncing';
+
   // Supabase Initial Fetch, Auto-Seed, and Realtime Subscription
   useEffect(() => {
     let isMounted = true;
 
     const initCloud = async () => {
+      setCloudSyncStatus('syncing');
+
       const creds = getSupabaseCredentials();
       if (!isMounted) return;
       setSupabaseStatus((prev) => ({ ...prev, source: creds.source }));
 
       if (creds.source !== 'none') {
-        setCloudSyncStatus('syncing');
         try {
           const testRes = await testSupabaseConnection();
           if (!isMounted) return;
@@ -135,8 +114,7 @@ export default function App() {
             source: creds.source,
           });
 
-          // Fetch cloud data
-          const { data: cloudData, error } = await fetchUniverseFromSupabase();
+          const { data: cloudData } = await fetchUniverseFromSupabase();
           if (!isMounted) return;
 
           if (cloudData) {
@@ -146,11 +124,31 @@ export default function App() {
             } catch {}
             setCloudSyncStatus('synced');
           } else {
-            setCloudSyncStatus(testRes.connected ? 'synced' : 'error');
+            const fallback = downloadUniverseFromLocalStorage();
+            if (fallback) {
+              setData({ ...DEFAULT_UNIVERSE, ...fallback });
+              setCloudSyncStatus('synced');
+            } else {
+              setData(DEFAULT_UNIVERSE);
+              setCloudSyncStatus(testRes.connected ? 'synced' : 'error');
+            }
           }
         } catch (err) {
           console.warn('Supabase initialization notice:', err);
-          if (isMounted) setCloudSyncStatus('error');
+          if (isMounted) {
+            const fallback = downloadUniverseFromLocalStorage();
+            if (fallback) setData({ ...DEFAULT_UNIVERSE, ...fallback });
+            setCloudSyncStatus('error');
+          }
+        }
+      } else {
+        const fallback = downloadUniverseFromLocalStorage();
+        if (fallback) {
+          setData({ ...DEFAULT_UNIVERSE, ...fallback });
+          setCloudSyncStatus('error');
+        } else {
+          setData(DEFAULT_UNIVERSE);
+          setCloudSyncStatus('error');
         }
       }
     };
@@ -170,9 +168,14 @@ export default function App() {
 
     return () => {
       isMounted = false;
+      setCloudInitComplete(true);
       unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    setCloudInitComplete(cloudSyncStatus !== 'syncing');
+  }, [cloudSyncStatus]);
 
   // Keyboard shortcut Shift + O or Shift + E to trigger PIN modal for owner convenience
   useEffect(() => {
@@ -226,22 +229,23 @@ export default function App() {
 
   // Save changes to localStorage and Supabase Cloud
   const handleSaveData = async (newData: UniverseData): Promise<{ success: boolean; message: string }> => {
-    setData(newData);
     setPreviewData(null);
     setIsPreviewActive(false);
 
-    // Save to local cache first
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
     } catch (err) {
       console.warn('LocalStorage save quota notice:', err);
     }
 
-    // Save to Supabase Cloud with verified PIN
     const pinToUse = currentOwnerPin || storedPin;
     const result = await saveUniverseToSupabase(newData, pinToUse);
 
     if (result.success) {
+      setData(newData);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
+      } catch {}
       setCloudSyncStatus('synced');
       showToast(result.message, 'success');
     } else {
@@ -346,8 +350,28 @@ export default function App() {
   const skyIntensity =
     currentScene === 'final' ? 'sunset' : currentScene === 'opening' ? 'ambient' : 'bright';
 
+  if (showCloudLoading) {
+    return (
+      <div className="relative min-h-screen w-full bg-[#FFF8F0] text-[#765563] flex items-center justify-center font-['Quicksand']">
+        <div className="flex flex-col items-center gap-4 rounded-[2rem] border-2 border-[#F8C8DC] bg-[#FFF8F0]/90 px-8 py-6 shadow-[0_20px_50px_rgba(233,154,181,0.18)]">
+          <div className="h-12 w-12 animate-spin rounded-full border-[4px] border-[#F8C8DC] border-t-[#E99AB5]" />
+          <div className="text-center">
+            <div className="text-lg font-bold">Loading your shared universe…</div>
+            <div className="text-sm text-[#765563]/70">Checking the latest cloud content before showing saved data.</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="relative min-h-screen w-full bg-[#FFF8F0] text-[#765563] flex flex-col font-['Quicksand'] selection:bg-[#F8C8DC] selection:text-[#765563] overflow-x-hidden">
+      {cloudSyncStatus === 'error' && (
+        <div className="fixed top-4 left-1/2 z-50 -translate-x-1/2 rounded-full border-2 border-[#F8C8DC] bg-[#FFF8F0]/95 px-4 py-2 text-xs font-bold text-[#765563] shadow-lg backdrop-blur-sm">
+          Cloud sync unavailable — showing the last saved local copy.
+        </div>
+      )}
+
       {/* 60fps Floating Daisies, Hearts & Pastel Clouds Background */}
       <DreamyPastelSky
         intensity={skyIntensity}
@@ -360,7 +384,7 @@ export default function App() {
 
       {/* Floating Preview Banner (Only visible when preview mode is active) */}
       {isPreviewActive && (
-        <aside aria-label="Preview Mode" className="fixed top-3 sm:top-4 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1.5rem)] max-w-md bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-3 sm:px-4 py-1.5 sm:py-2 rounded-full flex items-center justify-between gap-1.5 sm:gap-3 animate-fadeIn">
+        <aside aria-label="Preview Mode" className="fixed top-3 sm:top-4 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-1.5rem)] max-w-md bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-3 py-2 rounded-2xl flex items-center justify-between gap-2 sm:gap-3">
           <div className="flex items-center gap-1 sm:gap-1.5 text-[11px] sm:text-xs font-['Fredoka'] font-semibold text-[#765563] truncate">
             <Sparkles className="w-3.5 h-3.5 text-[#E99AB5] shrink-0" />
             <span className="truncate">Preview Mode</span>
@@ -372,7 +396,7 @@ export default function App() {
                 setIsPreviewActive(false);
                 setIsOwnerModeOpen(true);
               }}
-              className="px-2.5 sm:px-3 py-1 rounded-full bg-[#F8C8DC] hover:bg-[#E99AB5]/30 text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+              className="px-2.5 sm:px-3 py-1 rounded-full bg-[#F8C8DC] hover:bg-[#E99AB5]/30 text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold flex items-center gap-1 cursor-pointer"
             >
               <Edit3 className="w-3 h-3 text-[#E99AB5]" />
               <span className="hidden xs:inline">Editor</span>
@@ -383,7 +407,7 @@ export default function App() {
               onClick={() => {
                 if (previewData) handleSaveData(previewData);
               }}
-              className="px-2.5 sm:px-3.5 py-1 rounded-full bg-gradient-to-r from-[#F8C8DC] via-[#FFD8C2] to-[#FFF0B3] hover:from-[#E99AB5] hover:to-[#F8C8DC] text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold border border-white flex items-center gap-1 cursor-pointer shadow-xs transition-all"
+              className="px-2.5 sm:px-3.5 py-1 rounded-full bg-gradient-to-r from-[#F8C8DC] via-[#FFD8C2] to-[#FFF0B3] hover:from-[#E99AB5] hover:to-[#F8C8DC] text-[#765563] text-[11px] sm:text-xs font-['Quicksand'] font-bold flex items-center gap-1 cursor-pointer"
             >
               <Check className="w-3 h-3 text-[#765563]" />
               <span>Save</span>
@@ -478,7 +502,7 @@ export default function App() {
 
       {/* Romantic Subtle Footer with Discreet Owner Flower Trigger */}
       <footer className="relative z-20 pt-8 pb-20 sm:pb-8 px-4 text-center select-none mt-auto">
-        <div className="inline-flex max-w-full flex-wrap justify-center items-center gap-1.5 sm:gap-2 px-3.5 sm:px-4 py-1.5 rounded-full bg-[#FFF8F0]/90 backdrop-blur-xs border border-[#F8C8DC] text-[11px] sm:text-xs font-['Quicksand'] text-[#765563]/80 shadow-xs">
+        <div className="inline-flex max-w-full flex-wrap justify-center items-center gap-1.5 sm:gap-2 px-3.5 sm:px-4 py-1.5 rounded-full bg-[#FFF8F0]/90 backdrop-blur-xs border border-[#F8C8DC] shadow-sm">
           <span>made with so much love for {activeData.recipientName}</span>
           <button
             type="button"
@@ -504,7 +528,7 @@ export default function App() {
       {toastNotification && (
         <aside
           aria-label="Cloud sync notification"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-sm w-[calc(100%-2rem)] bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-4 py-2.5 rounded-2xl flex items-center gap-2.5 animate-fadeIn text-[#765563]"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 max-w-sm w-[calc(100%-2rem)] bg-[#FFF8F0]/95 backdrop-blur-md border-2 border-[#F8C8DC] shadow-xl px-4 py-2.5 rounded-2xl flex items-center gap-2"
         >
           <Sparkles className="w-4 h-4 text-[#E99AB5] shrink-0" />
           <span className="text-xs font-['Quicksand'] font-semibold flex-1">
@@ -545,3 +569,4 @@ export default function App() {
     </div>
   );
 }
+

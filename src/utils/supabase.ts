@@ -126,7 +126,6 @@ export async function adminSignUp(
       return { user: null, error: error.message };
     }
 
-    // If email confirmation is required by Supabase project settings
     if (data.user && !data.session) {
       return { user: data.user, confirmationSent: true };
     }
@@ -170,7 +169,6 @@ export function onAdminAuthStateChange(callback: (user: User | null) => void): (
 // Signed URLs & Private Bucket Handling
 // -------------------------------------------------------------
 
-// In-memory cache for signed URLs to minimize round-trips
 const signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
 
 export function getSignedUrlFromCache(storagePath: string): string | null {
@@ -184,7 +182,7 @@ export function getSignedUrlFromCache(storagePath: string): string | null {
 
 export async function createSignedUrlForPath(
   storagePath: string,
-  expiresInSeconds = 604800 // 7 days
+  expiresInSeconds = 604800
 ): Promise<{ url: string | null; error?: string }> {
   const supabase = getSupabase();
   if (!supabase) return { url: null, error: 'Supabase not initialized' };
@@ -193,7 +191,6 @@ export async function createSignedUrlForPath(
     ? storagePath
     : storagePath.replace(/^\/+/, '');
 
-  // Check cache first
   const cached = getSignedUrlFromCache(cleanPath);
   if (cached) return { url: cached };
 
@@ -206,7 +203,6 @@ export async function createSignedUrlForPath(
       return { url: null, error: error?.message || 'Failed to generate signed URL' };
     }
 
-    // Cache the signed URL
     signedUrlCache.set(cleanPath, {
       url: data.signedUrl,
       expiresAt: Date.now() + expiresInSeconds * 1000,
@@ -218,10 +214,6 @@ export async function createSignedUrlForPath(
   }
 }
 
-/**
- * Ensures all memories with storagePath or private paths have fresh,
- * active signed URLs so they display seamlessly on any visitor's phone or computer.
- */
 export async function refreshUniverseSignedUrls(universeData: UniverseData): Promise<UniverseData> {
   const supabase = getSupabase();
   if (!supabase || !universeData?.memories || universeData.memories.length === 0) {
@@ -233,7 +225,6 @@ export async function refreshUniverseSignedUrls(universeData: UniverseData): Pro
       const path = mem.storagePath || (mem.imageUrl?.startsWith('scrapbook/') ? mem.imageUrl : null);
       if (!path) return mem;
 
-      // Extract storage path from signed URL if already there
       const cleanPath = path.startsWith('scrapbook/') ? path : `scrapbook/${path.replace(/^.*scrapbook\//, '')}`;
 
       const { url } = await createSignedUrlForPath(cleanPath, 604800);
@@ -283,7 +274,6 @@ export async function testSupabaseConnection(): Promise<{
   }
 
   try {
-    // 0. Check admin authentication status
     let isAdminAuthenticated = false;
     let adminEmail: string | undefined;
     try {
@@ -294,7 +284,6 @@ export async function testSupabaseConnection(): Promise<{
       }
     } catch {}
 
-    // 1. Test database table (public select)
     let tableFound = false;
     let hasCloudData = false;
     let cloudPhotoCount = 0;
@@ -311,7 +300,6 @@ export async function testSupabaseConnection(): Promise<{
       cloudPhotoCount = memories.filter((m) => Boolean(m.storagePath || isCloudImageUrl(m.imageUrl))).length;
     }
 
-    // 2. Test storage bucket
     let storageFound = false;
     try {
       const { data: objectList, error: listError } = await supabase.storage
@@ -381,8 +369,9 @@ export async function fetchUniverseFromSupabase(): Promise<{ data: UniverseData 
   try {
     const { data, error } = await supabase
       .from('universe_data')
-      .select('data, updated_at')
-      .eq('id', 'current')
+      .select('id, data, updated_at')
+      .order('updated_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) {
@@ -393,7 +382,6 @@ export async function fetchUniverseFromSupabase(): Promise<{ data: UniverseData 
       return { data: null };
     }
 
-    // Refresh signed URLs for private bucket images
     const rawData = data.data as UniverseData;
     const refreshed = await refreshUniverseSignedUrls(rawData);
     return { data: refreshed };
@@ -415,7 +403,6 @@ export async function saveUniverseToSupabase(
   }
 
   try {
-    // Check if user is authenticated with Supabase Auth
     const { data: { user } } = await supabase.auth.getUser();
 
     if (!user) {
@@ -426,14 +413,33 @@ export async function saveUniverseToSupabase(
       };
     }
 
-    // 1. Direct authorized table upsert (preferred Supabase Auth pattern)
+    let targetId: string | number | null = null;
+    try {
+      const { data: existingRow } = await supabase
+        .from('universe_data')
+        .select('id')
+        .limit(1)
+        .maybeSingle();
+
+      if (existingRow && existingRow.id !== undefined && existingRow.id !== null) {
+        targetId = existingRow.id;
+      }
+    } catch {
+      // Ignore and let the backend decide the row on the next upsert.
+    }
+
+    const upsertPayload: Record<string, any> = {
+      data: universeData,
+      pin_hash: 'admin-auth',
+      updated_at: new Date().toISOString(),
+    };
+
+    if (targetId !== null && targetId !== undefined) {
+      upsertPayload.id = targetId;
+    }
+
     const { error: upsertError } = await supabase.from('universe_data').upsert(
-      {
-        id: 'current',
-        data: universeData,
-        pin_hash: 'admin-auth',
-        updated_at: new Date().toISOString(),
-      },
+      upsertPayload,
       { onConflict: 'id' }
     );
 
@@ -446,7 +452,6 @@ export async function saveUniverseToSupabase(
 
     console.warn('Direct upsert returned error, trying RPC fallback:', upsertError);
 
-    // 2. RPC fallback: save_universe_data
     const { error: rpcError } = await supabase.rpc('save_universe_data', {
       new_data: universeData,
       edit_pin: pin,
@@ -468,7 +473,7 @@ export async function saveUniverseToSupabase(
       return {
         success: false,
         message:
-          'Database save error: row violates row-level security policy for table "universe_data". Run the updated SQL setup script in Supabase SQL Editor to grant authenticated write permissions.',
+          'Database save error: row violates row-level security policy for table "universe_data". Run the updated SQL setup script in Supabase SQL Editor to grant authenticated write permissions for the shared content row.',
       };
     }
 
@@ -541,10 +546,6 @@ export function isLocalImageData(url?: string): boolean {
   );
 }
 
-/**
- * Detects external URLs (such as Gmail attachments) that cannot be fetched
- * by browser scripts due to authentication cookies or CORS policies.
- */
 export function isUnfetchableExternalUrl(url?: string): { blocked: boolean; reason?: string } {
   if (!url) return { blocked: false };
   const trimmed = url.trim().toLowerCase();
@@ -584,7 +585,6 @@ export async function imageSourceToBlob(source: string): Promise<ImageConversion
   if (!source) return { blob: null, mimeType: '', reason: 'Empty image source' };
   const trimmed = source.trim();
 
-  // 1. Direct Base64 Data URL decoding (offline, safe, never touches network)
   if (trimmed.startsWith('data:')) {
     try {
       const parts = trimmed.split(';base64,');
@@ -604,7 +604,6 @@ export async function imageSourceToBlob(source: string): Promise<ImageConversion
     }
   }
 
-  // 2. Proactively detect blocked external URLs (e.g. Gmail attachments) WITHOUT triggering fetch errors
   const urlCheck = isUnfetchableExternalUrl(trimmed);
   if (urlCheck.blocked) {
     return {
@@ -615,7 +614,6 @@ export async function imageSourceToBlob(source: string): Promise<ImageConversion
     };
   }
 
-  // 3. Browser native fetch for blob:, relative local paths, or public URLs
   try {
     const res = await fetch(trimmed);
     if (res.ok) {
@@ -655,10 +653,6 @@ export const base64ToBlob = (base64DataUrl: string) => {
   }
 };
 
-/**
- * Uploads an image to the private scrapbook-images bucket and generates a 7-day signed URL.
- * Preserves the permanent storagePath for database storage.
- */
 export async function uploadImageToSupabaseStorage(
   file: File | Blob,
   customFileName?: string,
@@ -670,7 +664,6 @@ export async function uploadImageToSupabaseStorage(
   }
 
   try {
-    // Check if user is authenticated
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) {
       return { error: 'Admin authentication required to upload photos. Please sign in to Supabase Auth.' };
@@ -706,14 +699,12 @@ export async function uploadImageToSupabaseStorage(
 
     if (onProgress) onProgress(75);
 
-    // Generate signed URL (7 days = 604800 seconds) for private bucket access
     const { url: signedUrl, error: signError } = await createSignedUrlForPath(filePath, 604800);
 
     if (signError || !signedUrl) {
       return { error: `File uploaded to ${filePath}, but failed to generate signed URL: ${signError}` };
     }
 
-    // Non-blocking metadata insert for tracking
     try {
       await supabase.from('scrapbook_images').insert({
         file_path: filePath,
@@ -858,7 +849,6 @@ export async function migrateLocalContentToSupabase(options: {
     };
   }
 
-  // Check admin authentication
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) {
     return {
@@ -871,7 +861,6 @@ export async function migrateLocalContentToSupabase(options: {
     };
   }
 
-  // Use provided sourceData or read from localStorage
   const localData = options.sourceData || downloadUniverseFromLocalStorage();
   if (!localData) {
     return {
@@ -892,7 +881,6 @@ export async function migrateLocalContentToSupabase(options: {
     message: 'Verifying Supabase connection and checking existing cloud data...',
   });
 
-  // Check if server already has data
   if (!options.forceOverwriteServer) {
     const { data: serverData } = await fetchUniverseFromSupabase();
     if (serverData && serverData.memories && serverData.memories.length > 0) {
@@ -923,7 +911,6 @@ export async function migrateLocalContentToSupabase(options: {
     const imageUrl = (memory.imageUrl || '').trim();
     const storagePath = (memory.storagePath || '').trim();
 
-    // Skip duplicate upload if already in Supabase Cloud
     if (storagePath || isCloudImageUrl(imageUrl)) {
       alreadyCloudCount++;
       options.onItemComplete?.({
@@ -936,7 +923,6 @@ export async function migrateLocalContentToSupabase(options: {
       continue;
     }
 
-    // If memory has a local image or base64 or blob or relative path
     if (imageUrl) {
       options.onProgress?.({
         stage: 'uploading',
@@ -977,7 +963,6 @@ export async function migrateLocalContentToSupabase(options: {
           });
         }
       } else {
-        // Skipped because unfetchable (e.g. Gmail attachment) or fetch failed
         failedCount++;
         const errMsg = parsed.reason || 'Could not fetch image';
         errors.push({
@@ -994,7 +979,6 @@ export async function migrateLocalContentToSupabase(options: {
           error: errMsg,
           isManualRequired: Boolean(parsed.isBlocked),
         });
-        // Note: We preserve updatedMemories[i] intact so original data is not lost!
       }
     }
   }
@@ -1015,7 +999,6 @@ export async function migrateLocalContentToSupabase(options: {
   const saveResult = await saveUniverseToSupabase(migratedData, options.pin);
 
   if (saveResult.success) {
-    // Preserve local data safely by updating cache with permanent URLs (no deletion)
     try {
       localStorage.setItem('our_universe_data_v1', JSON.stringify(migratedData));
     } catch {}
@@ -1067,11 +1050,6 @@ export async function migrateLocalContentToSupabase(options: {
   }
 }
 
-/**
- * Uploads a user-selected image file from disk for a specific memory,
- * updates the memory's storagePath and signed imageUrl,
- * and saves the updated universe to Supabase and localStorage.
- */
 export async function uploadSingleMemoryImageFile(
   memoryId: string,
   file: File,
@@ -1113,7 +1091,6 @@ export async function uploadSingleMemoryImageFile(
     memories: updatedMemories,
   };
 
-  // Save to database
   const saveRes = await saveUniverseToSupabase(newUniverse, '1234');
   if (!saveRes.success) {
     return {
@@ -1122,7 +1099,6 @@ export async function uploadSingleMemoryImageFile(
     };
   }
 
-  // Update local cache safely
   try {
     localStorage.setItem('our_universe_data_v1', JSON.stringify(newUniverse));
   } catch {}
@@ -1143,7 +1119,6 @@ export function subscribeToUniverseChanges(onUpdate: (newData: UniverseData) => 
           event: '*',
           schema: 'public',
           table: 'universe_data',
-          filter: 'id=eq.current',
         },
         async (payload: any) => {
           if (payload?.new?.data) {
@@ -1189,7 +1164,6 @@ export function resolveAssetUrl(url?: string): string {
     return trimmed;
   }
 
-  // Check signed URL cache for scrapbook storage paths
   if (trimmed.startsWith('scrapbook/')) {
     const cached = getSignedUrlFromCache(trimmed);
     if (cached) return cached;
@@ -1244,3 +1218,4 @@ create policy "Scrapbook images delete"
   to authenticated
   using (bucket_id = 'scrapbook-images');
 `;
+

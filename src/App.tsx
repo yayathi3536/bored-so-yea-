@@ -92,9 +92,40 @@ export default function App() {
 
   const showCloudLoading = !cloudInitComplete && cloudSyncStatus === 'syncing';
 
-  // Supabase Initial Fetch, Auto-Seed, and Realtime Subscription
+  // Newest cloud row version (updated_at) applied to state. Used to ignore stale async results.
+  const cloudVersionRef = useRef<string | null>(null);
+
+  // True when `incoming` is not older than what we've already applied from the cloud.
+  const isNotStale = (incoming?: string | null) => {
+    const current = cloudVersionRef.current;
+    if (!incoming || !current) return true;
+    return new Date(incoming).getTime() >= new Date(current).getTime();
+  };
+
+  // Diagnostic log: data source + outcome only. Never logs content, keys, PINs or tokens.
+  const logDataSource = (
+    source: 'cloud' | 'local-fallback' | 'default',
+    detail: Record<string, string | number | boolean | null | undefined> = {}
+  ) => {
+    console.info('[universe-sync] data source:', source, detail);
+  };
+
+  // Supabase is the canonical source. localStorage is used ONLY when the cloud load genuinely fails.
   useEffect(() => {
     let isMounted = true;
+
+    const useLocalFallback = (reason: string) => {
+      const fallback = downloadUniverseFromLocalStorage();
+      if (fallback) {
+        setData({ ...DEFAULT_UNIVERSE, ...fallback });
+        logDataSource('local-fallback', { reason, memories: fallback.memories?.length ?? 0 });
+      } else {
+        setData(DEFAULT_UNIVERSE);
+        logDataSource('default', { reason });
+      }
+      // A fallback is NOT a successful cloud sync, so never report it as 'synced'.
+      setCloudSyncStatus('error');
+    };
 
     const initCloud = async () => {
       setCloudSyncStatus('syncing');
@@ -103,65 +134,62 @@ export default function App() {
       if (!isMounted) return;
       setSupabaseStatus((prev) => ({ ...prev, source: creds.source }));
 
-      if (creds.source !== 'none') {
-        try {
-          const testRes = await testSupabaseConnection();
-          if (!isMounted) return;
-          setSupabaseStatus({
-            connected: testRes.connected,
-            tableFound: testRes.tableFound,
-            storageFound: testRes.storageFound,
-            source: creds.source,
+      if (creds.source === 'none') {
+        // No anon key in this build or browser: the cloud request cannot be made at all.
+        useLocalFallback('no-anon-key (VITE_SUPABASE_ANON_KEY missing from this build)');
+        return;
+      }
+
+      try {
+        const testRes = await testSupabaseConnection();
+        if (!isMounted) return;
+        setSupabaseStatus({
+          connected: testRes.connected,
+          tableFound: testRes.tableFound,
+          storageFound: testRes.storageFound,
+          source: creds.source,
+        });
+
+        const { data: cloudData, error: cloudError, updatedAt } = await fetchUniverseFromSupabase();
+        if (!isMounted) return;
+
+        if (cloudData) {
+          if (!isNotStale(updatedAt)) {
+            // A newer realtime update already landed while this request was in flight.
+            logDataSource('cloud', { ignoredStaleResponse: true, updated_at: updatedAt });
+            return;
+          }
+          cloudVersionRef.current = updatedAt ?? cloudVersionRef.current;
+          setData({ ...DEFAULT_UNIVERSE, ...cloudData });
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
+          } catch {}
+          setCloudSyncStatus('synced');
+          logDataSource('cloud', {
+            keySource: creds.source,
+            updated_at: updatedAt,
+            memories: cloudData.memories?.length ?? 0,
           });
-
-          const { data: cloudData } = await fetchUniverseFromSupabase();
-          if (!isMounted) return;
-
-          if (cloudData) {
-            setData(cloudData);
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
-            } catch {}
-            setCloudSyncStatus('synced');
-          } else {
-            const fallback = downloadUniverseFromLocalStorage();
-            if (fallback) {
-              setData({ ...DEFAULT_UNIVERSE, ...fallback });
-              setCloudSyncStatus('synced');
-            } else {
-              setData(DEFAULT_UNIVERSE);
-              setCloudSyncStatus(testRes.connected ? 'synced' : 'error');
-            }
-          }
-        } catch (err) {
-          console.warn('Supabase initialization notice:', err);
-          if (isMounted) {
-            const fallback = downloadUniverseFromLocalStorage();
-            if (fallback) setData({ ...DEFAULT_UNIVERSE, ...fallback });
-            setCloudSyncStatus('error');
-          }
-        }
-      } else {
-        const fallback = downloadUniverseFromLocalStorage();
-        if (fallback) {
-          setData({ ...DEFAULT_UNIVERSE, ...fallback });
-          setCloudSyncStatus('error');
         } else {
-          setData(DEFAULT_UNIVERSE);
-          setCloudSyncStatus('error');
+          useLocalFallback(`cloud-load-failed: ${cloudError || 'unknown'}`);
         }
+      } catch (err: any) {
+        if (isMounted) useLocalFallback(`cloud-load-exception: ${err?.message || 'unknown'}`);
       }
     };
 
     initCloud();
 
     // Supabase Realtime channel subscription
-    const unsubscribe = subscribeToUniverseChanges((newData) => {
+    const unsubscribe = subscribeToUniverseChanges((newData, updatedAt) => {
       if (!isMounted) return;
-      setData(newData);
+      if (!isNotStale(updatedAt)) return;
+      cloudVersionRef.current = updatedAt ?? cloudVersionRef.current;
+      setData({ ...DEFAULT_UNIVERSE, ...newData });
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(newData));
       } catch {}
+      logDataSource('cloud', { via: 'realtime', updated_at: updatedAt });
       audioEngine.playBlip(1.2);
       showToast('✨ Updated from another device in real-time!', 'success');
     });

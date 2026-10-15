@@ -17,6 +17,11 @@ export function resolveAssetUrl(url: string | undefined): string {
     return trimmed;
   }
 
+  // If path is a Supabase Storage path like scrapbook/...
+  if (trimmed.startsWith('scrapbook/')) {
+    return `https://updbgvanowpgjbkdliyo.supabase.co/storage/v1/object/public/scrapbook-images/${trimmed}`;
+  }
+
   // Normalize legacy image names or aliases
   let clean = trimmed;
   if (clean.includes('1000080965.jpg')) {

@@ -28,6 +28,8 @@ import {
   subscribeToUniverseChanges,
   getSupabaseCredentials,
   testSupabaseConnection,
+  migrateLocalContentToSupabase,
+  downloadUniverseFromLocalStorage,
 } from './utils/supabase';
 
 const STORAGE_KEY = 'our_universe_data_v1';
@@ -248,19 +250,29 @@ export default function App() {
       setCloudSyncStatus('synced');
       showToast(result.message, 'success');
     } else {
-      showToast(result.message, 'info');
+      setCloudSyncStatus('error');
+      showToast(result.message, 'error');
     }
 
     return result;
   };
 
-  // Manually push local edits to Supabase
-  const handleMigrateToSupabase = async (): Promise<{ success: boolean; message: string }> => {
+  // Manually push local edits to Supabase, including uploading all local photos to Supabase Storage
+  const handleMigrateToSupabase = async (forceOverwrite: boolean = true): Promise<{ success: boolean; message: string }> => {
     const pinToUse = currentOwnerPin || storedPin;
-    const result = await saveUniverseToSupabase(data, pinToUse);
+    setCloudSyncStatus('syncing');
+    const result = await migrateLocalContentToSupabase({
+      pin: pinToUse,
+      forceOverwriteServer: forceOverwrite,
+    });
     if (result.success) {
+      const refreshed = downloadUniverseFromLocalStorage();
+      if (refreshed) setData(refreshed);
       setCloudSyncStatus('synced');
-      showToast('✨ All local customizations successfully synced to Supabase!', 'success');
+      showToast(result.message, 'success');
+    } else {
+      setCloudSyncStatus('error');
+      showToast(result.message, 'error');
     }
     return result;
   };

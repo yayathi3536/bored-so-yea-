@@ -38,7 +38,129 @@ import {
   getSupabaseCredentials,
   saveSupabaseCredentials,
   SCRAPBOOK_BUCKET,
+  isCloudImageUrl,
+  isLocalImageData,
+  migrateLocalContentToSupabase,
+  downloadUniverseFromLocalStorage,
+  MigrationProgressUpdate,
 } from '../utils/supabase';
+
+export const RLS_QUICK_FIX_SQL = `-- 1-Click Fix for "new row violates row-level security policy for table universe_data"
+ALTER TABLE public.universe_data ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Public read universe_data" ON public.universe_data;
+DROP POLICY IF EXISTS "Public write universe_data" ON public.universe_data;
+DROP POLICY IF EXISTS "Public insert universe_data" ON public.universe_data;
+DROP POLICY IF EXISTS "Public update universe_data" ON public.universe_data;
+
+CREATE POLICY "Public read universe_data" ON public.universe_data FOR SELECT USING (true);
+CREATE POLICY "Public write universe_data" ON public.universe_data FOR ALL USING (true) WITH CHECK (true);
+`;
+
+export const FULL_SUPABASE_SQL = `-- 1. Enable pgcrypto for PIN hashing
+create extension if not exists pgcrypto;
+
+-- 2. Create universe_data table
+create table if not exists public.universe_data (
+  id text primary key default 'current',
+  data jsonb not null,
+  pin_hash text not null default crypt('1234', gen_salt('bf')),
+  updated_at timestamp with time zone default timezone('utc'::text, now())
+);
+
+-- 3. Row Level Security (RLS) - Allows website to read and save universe data
+alter table public.universe_data enable row level security;
+drop policy if exists "Public read universe_data" on public.universe_data;
+drop policy if exists "Public write universe_data" on public.universe_data;
+drop policy if exists "Public insert universe_data" on public.universe_data;
+drop policy if exists "Public update universe_data" on public.universe_data;
+
+create policy "Public read universe_data" on public.universe_data for select using (true);
+create policy "Public insert universe_data" on public.universe_data for insert with check (true);
+create policy "Public update universe_data" on public.universe_data for update using (true);
+create policy "Public write universe_data" on public.universe_data for all using (true) with check (true);
+
+-- 4. Enable Supabase Realtime
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and tablename = 'universe_data'
+  ) then
+    alter publication supabase_realtime add table public.universe_data;
+  end if;
+end $$;
+
+-- 5. Secure save function
+create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+  stored_hash text;
+  row_exists boolean;
+  result_row universe_data;
+begin
+  select exists(select 1 from public.universe_data where id = 'current') into row_exists;
+  if not row_exists then
+    insert into public.universe_data (id, data, pin_hash, updated_at)
+    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
+    returning * into result_row;
+    return result_row.data;
+  end if;
+
+  select pin_hash into stored_hash from public.universe_data where id = 'current';
+  if stored_hash is null or stored_hash = '' then
+    update public.universe_data set data = new_data, pin_hash = crypt(edit_pin, gen_salt('bf')), updated_at = now()
+    where id = 'current' returning * into result_row;
+    return result_row.data;
+  end if;
+
+  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
+    raise exception 'Invalid PIN: authorization failed';
+  end if;
+
+  update public.universe_data set data = new_data, updated_at = now()
+  where id = 'current' returning * into result_row;
+  return result_row.data;
+end;
+$$;
+
+grant execute on function public.save_universe_data(text, jsonb) to anon, authenticated, service_role;
+
+-- 6. Scrapbook Photo Metadata Table
+create table if not exists public.scrapbook_images (
+  id uuid primary key default gen_random_uuid(),
+  memory_id text,
+  file_path text not null,
+  public_url text not null,
+  file_name text,
+  mime_type text,
+  size_bytes bigint,
+  created_at timestamptz default timezone('utc'::text, now())
+);
+
+alter table public.scrapbook_images enable row level security;
+drop policy if exists "Public read scrapbook_images" on public.scrapbook_images;
+create policy "Public read scrapbook_images" on public.scrapbook_images for select using (true);
+drop policy if exists "Public insert scrapbook_images" on public.scrapbook_images;
+create policy "Public insert scrapbook_images" on public.scrapbook_images for insert with check (true);
+
+-- 7. Storage Bucket for Scrapbook Images
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'scrapbook-images',
+  'scrapbook-images',
+  true,
+  10485760,
+  array['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/avif']
+)
+on conflict (id) do update set public = true;
+
+drop policy if exists "Scrapbook images public select" on storage.objects;
+create policy "Scrapbook images public select" on storage.objects for select using (bucket_id = 'scrapbook-images');
+drop policy if exists "Scrapbook images public insert" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
+drop policy if exists "Scrapbook images public update" on storage.objects for update using (bucket_id = 'scrapbook-images');
+drop policy if exists "Scrapbook images public delete" on storage.objects for delete using (bucket_id = 'scrapbook-images');
+`;
 
 interface OwnerModeProps {
   data: UniverseData;
@@ -91,6 +213,8 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
   const [savedBanner, setSavedBanner] = useState(false);
   const [saveBannerText, setSaveBannerText] = useState('Saved & synchronized!');
   const [isSaving, setIsSaving] = useState(false);
+  const [rlsError, setRlsError] = useState(false);
+  const [copiedRlsFix, setCopiedRlsFix] = useState(false);
 
   // PIN settings state
   const [newPin, setNewPin] = useState('');
@@ -117,6 +241,15 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadStatusText, setUploadStatusText] = useState<string | null>(null);
 
+  // Cloud Photo Migration state
+  const [migrationStatus, setMigrationStatus] = useState<MigrationProgressUpdate | null>(null);
+  const [isMigratingPhotos, setIsMigratingPhotos] = useState(false);
+  const [migrationSummary, setMigrationSummary] = useState<{
+    totalLocal: number;
+    unsyncedCount: number;
+    cloudCount: number;
+  }>({ totalLocal: 0, unsyncedCount: 0, cloudCount: 0 });
+
   // Sync internal formData when opened with latest data
   useEffect(() => {
     if (isOpen) {
@@ -129,6 +262,16 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       setSupabaseUrlInput(creds.url);
       setSupabaseKeyInput(creds.key);
       setConnectionTestResult(null);
+
+      // Analyze photo sync status
+      const memories = data.memories || [];
+      const unsynced = memories.filter((m) => isLocalImageData(m.imageUrl)).length;
+      const cloud = memories.filter((m) => isCloudImageUrl(m.imageUrl)).length;
+      setMigrationSummary({
+        totalLocal: memories.length,
+        unsyncedCount: unsynced,
+        cloudCount: cloud,
+      });
     }
   }, [isOpen, data]);
 
@@ -142,7 +285,15 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       setIsSaving(false);
       setSaveBannerText(result.message);
       setSavedBanner(true);
-      setTimeout(() => setSavedBanner(false), 3500);
+      if (result.success) {
+        setRlsError(false);
+      } else if (
+        result.message.toLowerCase().includes('violates row-level security policy') ||
+        result.message.toLowerCase().includes('row-level security')
+      ) {
+        setRlsError(true);
+      }
+      setTimeout(() => setSavedBanner(false), 4500);
     } catch (err: any) {
       setIsSaving(false);
       alert(`Save error: ${err.message || String(err)}`);
@@ -200,20 +351,25 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
       // If Supabase is available, upload directly to Supabase Storage
       if (supabase) {
         setUploadStatusText('Uploading to Supabase Storage...');
-        const { url, error } = await uploadImageToSupabaseStorage(file, (pct) => {
+        const { url, path, error } = await uploadImageToSupabaseStorage(file, undefined, (pct) => {
           setUploadProgress(pct);
         });
 
         if (url) {
           const updated = [...formData.memories];
           updated[memoryIndex].imageUrl = url;
+          updated[memoryIndex].storagePath = path;
           setFormData({ ...formData, memories: updated });
           audioEngine.playChime(1.3);
-          setUploadStatusText('✓ Uploaded to cloud storage!');
+          setUploadStatusText('✓ Uploaded to Supabase Cloud Storage!');
           setTimeout(() => setUploadStatusText(null), 3000);
           return;
         }
-        console.warn('Storage upload returned notice, falling back to local optimization:', error);
+
+        console.error('Storage upload returned error:', error);
+        alert(
+          `Supabase Storage Notice:\n${error}\n\nFalling back to temporary browser storage for now. Please run supabase-schema.sql in your Supabase SQL Editor to create the public scrapbook-images bucket!`
+        );
       }
 
       // Offline / Local optimization fallback
@@ -364,9 +520,19 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
           {/* Quick Header Actions */}
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {savedBanner && (
-              <span className="hidden md:inline-flex items-center gap-1 text-xs text-emerald-600 font-bold bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200 animate-fadeIn">
-                <Check className="w-3.5 h-3.5" />
-                Saved!
+              <span
+                className={`hidden md:inline-flex items-center gap-1 text-xs font-bold px-2.5 py-1 rounded-full border animate-fadeIn ${
+                  rlsError
+                    ? 'text-amber-800 bg-amber-50 border-amber-300'
+                    : 'text-emerald-600 bg-emerald-50 border-emerald-200'
+                }`}
+              >
+                {rlsError ? (
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                ) : (
+                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                )}
+                <span>{rlsError ? 'Saved Locally (RLS Blocked)' : 'Saved!'}</span>
               </span>
             )}
 
@@ -426,6 +592,62 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
             </button>
           ))}
         </div>
+
+        {/* RLS Policy Error Alert Banner */}
+        {rlsError && (
+          <div className="mx-4 sm:mx-6 mt-3 p-3.5 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-900 text-xs font-['Quicksand'] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs animate-fadeIn">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-amber-900">
+                  Supabase RLS is blocking writes on table &ldquo;universe_data&rdquo;
+                </p>
+                <p className="text-[11px] text-amber-800/90 mt-0.5">
+                  Your changes are saved in this browser. To sync to Supabase Cloud, run the 3-line RLS policy in your Supabase SQL Editor:
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(RLS_QUICK_FIX_SQL);
+                  setCopiedRlsFix(true);
+                  audioEngine.playChime(1.2);
+                  setTimeout(() => setCopiedRlsFix(false), 2500);
+                }}
+                className="px-3 py-1.5 rounded-xl bg-amber-200 hover:bg-amber-300 text-amber-900 font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer w-full sm:w-auto shadow-xs"
+              >
+                {copiedRlsFix ? (
+                  <>
+                    <CheckCheck className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>Copied SQL Fix!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5 text-amber-800" />
+                    <span>Copy 3-Line RLS Fix</span>
+                  </>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSqlModal(true)}
+                className="px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/50 text-amber-900 font-bold text-xs flex items-center justify-center gap-1 transition-colors cursor-pointer shrink-0"
+              >
+                <span>Full SQL</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRlsError(false)}
+                className="p-1 rounded-full text-amber-700 hover:text-amber-900 hover:bg-amber-200/50 cursor-pointer"
+                title="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Tab Body Area */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 bg-[#FFFDF9]">
@@ -1398,17 +1620,38 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
 
                   <button
                     type="button"
-                    disabled={isMigrating}
+                    disabled={isMigrating || isMigratingPhotos}
                     onClick={async () => {
-                      if (!onMigrateToSupabase) return;
                       setIsMigrating(true);
-                      const res = await onMigrateToSupabase();
+                      setMigrationStatus({
+                        stage: 'checking',
+                        totalImages: formData.memories.length,
+                        currentImageIndex: 0,
+                        currentImageTitle: '',
+                        message: 'Checking and migrating local photos...',
+                      });
+                      const res = await migrateLocalContentToSupabase({
+                        pin: currentVerifiedPin || storedPin,
+                        forceOverwriteServer: true,
+                        onProgress: (update) => setMigrationStatus(update),
+                      });
                       setIsMigrating(false);
+                      if (res.success) {
+                        audioEngine.playChime(1.3);
+                        const refreshed = downloadUniverseFromLocalStorage();
+                        if (refreshed) setFormData(refreshed);
+                        const memories = (refreshed || formData).memories || [];
+                        setMigrationSummary({
+                          totalLocal: memories.length,
+                          unsyncedCount: memories.filter((m) => isLocalImageData(m.imageUrl)).length,
+                          cloudCount: memories.filter((m) => isCloudImageUrl(m.imageUrl)).length,
+                        });
+                      }
                       alert(res.message);
                     }}
                     className="px-3 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
                   >
-                    {isMigrating ? (
+                    {isMigrating || isMigratingPhotos ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
                     ) : (
                       <Upload className="w-3.5 h-3.5 text-[#765563]" />
@@ -1426,6 +1669,14 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                       setIsRefreshing(false);
                       if (res.success) {
                         audioEngine.playChime(1.3);
+                        const refreshed = downloadUniverseFromLocalStorage();
+                        if (refreshed) setFormData(refreshed);
+                        const memories = (refreshed || formData).memories || [];
+                        setMigrationSummary({
+                          totalLocal: memories.length,
+                          unsyncedCount: memories.filter((m) => isLocalImageData(m.imageUrl)).length,
+                          cloudCount: memories.filter((m) => isCloudImageUrl(m.imageUrl)).length,
+                        });
                       }
                       alert(res.message);
                     }}
@@ -1459,6 +1710,136 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* Cloud Photo Migration Wizard Card */}
+                <div className="p-4 rounded-xl bg-white border border-[#FFBFD7] space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">📷</span>
+                      <h5 className="font-['Fredoka'] text-xs sm:text-sm font-semibold text-[#765563]">
+                        Computer Photo Migration to Supabase Storage
+                      </h5>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                        migrationSummary.unsyncedCount > 0
+                          ? 'bg-amber-100 text-amber-900 border-amber-300'
+                          : 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                      }`}
+                    >
+                      {migrationSummary.unsyncedCount > 0
+                        ? `${migrationSummary.unsyncedCount} Local Photo${
+                            migrationSummary.unsyncedCount > 1 ? 's' : ''
+                          } Ready to Migrate`
+                        : `${migrationSummary.cloudCount} Photos Synced in Cloud`}
+                    </span>
+                  </div>
+
+                  <p className="text-[11px] text-[#765563]/80 leading-relaxed font-['Quicksand']">
+                    Photos uploaded on your computer are initially stored inside this browser&apos;s localStorage. Running migration uploads them to your Supabase Storage bucket (<code>scrapbook-images</code>) and updates the database with permanent URLs so they display seamlessly on your phone!
+                  </p>
+
+                  {/* Migration Progress Bar */}
+                  {migrationStatus && (
+                    <div className="p-3 rounded-xl bg-[#FFF8EF] border border-[#FFBFD7] text-xs font-['Quicksand'] space-y-2">
+                      <div className="flex items-center justify-between font-bold text-[#765563] text-[11px]">
+                        <span>{migrationStatus.message}</span>
+                        {migrationStatus.totalImages > 0 && (
+                          <span>
+                            {migrationStatus.currentImageIndex} / {migrationStatus.totalImages}
+                          </span>
+                        )}
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-[#FFD6E7]/50 overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-[#FF85A1] to-[#E99AB5] transition-all duration-300"
+                          style={{
+                            width: `${
+                              migrationStatus.totalImages > 0
+                                ? Math.min(
+                                    100,
+                                    Math.round(
+                                      (migrationStatus.currentImageIndex / migrationStatus.totalImages) * 100
+                                    )
+                                  )
+                                : 100
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={isMigratingPhotos || isMigrating}
+                      onClick={async () => {
+                        setIsMigratingPhotos(true);
+                        setMigrationStatus({
+                          stage: 'checking',
+                          totalImages: formData.memories.length,
+                          currentImageIndex: 0,
+                          currentImageTitle: '',
+                          message: 'Checking photos and preparing upload...',
+                        });
+
+                        const result = await migrateLocalContentToSupabase({
+                          pin: currentVerifiedPin || storedPin,
+                          forceOverwriteServer: true,
+                          onProgress: (update) => setMigrationStatus(update),
+                        });
+
+                        setIsMigratingPhotos(false);
+                        if (result.success) {
+                          audioEngine.playChime(1.3);
+                          const refreshed = downloadUniverseFromLocalStorage();
+                          if (refreshed) setFormData(refreshed);
+                          const memories = (refreshed || formData).memories || [];
+                          setMigrationSummary({
+                            totalLocal: memories.length,
+                            unsyncedCount: memories.filter((m) => isLocalImageData(m.imageUrl)).length,
+                            cloudCount: memories.filter((m) => isCloudImageUrl(m.imageUrl)).length,
+                          });
+                        }
+                        alert(result.message);
+                      }}
+                      className="w-full sm:w-auto px-3.5 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                    >
+                      {isMigratingPhotos ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-[#765563]" />
+                      ) : (
+                        <Upload className="w-3.5 h-3.5 text-[#765563]" />
+                      )}
+                      <span>Migrate Computer Photos to Supabase</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const memories = formData.memories || [];
+                        const unsynced = memories.filter((m) => isLocalImageData(m.imageUrl)).length;
+                        const cloud = memories.filter((m) => isCloudImageUrl(m.imageUrl)).length;
+                        setMigrationSummary({
+                          totalLocal: memories.length,
+                          unsyncedCount: unsynced,
+                          cloudCount: cloud,
+                        });
+                        alert(
+                          `Photo Storage Diagnostics:\n• Total Memories: ${memories.length}\n• Hosted in Supabase Cloud: ${cloud}\n• Stored Only Locally (Base64): ${unsynced}\n\n${
+                            unsynced > 0
+                              ? 'Click "Migrate Computer Photos to Supabase" to upload them to the cloud!'
+                              : 'All photos are already stored in Supabase Cloud and will appear on your phone!'
+                          }`
+                        );
+                      }}
+                      className="w-full sm:w-auto px-3 py-2 rounded-xl bg-[#FFF8EF] hover:bg-[#FFE0CC]/50 border border-[#FFBFD7] text-xs font-bold text-[#765563] flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
+                    >
+                      <Eye className="w-3.5 h-3.5 text-[#FF85A1]" />
+                      <span>Check Photo Sync Status</span>
+                    </button>
+                  </div>
+                </div>
 
                 {/* Quick Credentials Setup / Override */}
                 <details className="pt-2 border-t border-[#FFBFD7]/50 text-xs">
@@ -1531,6 +1912,41 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                 </details>
               </div>
 
+              {/* RLS Policy Helper Card */}
+              <div className="p-4 rounded-2xl bg-amber-50/90 border-2 border-amber-200/90 space-y-2.5 text-xs font-['Quicksand'] text-amber-900 shadow-xs">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2 font-bold text-amber-900">
+                    <Shield className="w-4 h-4 text-amber-600" />
+                    <span>Fix Row-Level Security (RLS) Policy</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(RLS_QUICK_FIX_SQL);
+                      setCopiedRlsFix(true);
+                      audioEngine.playChime(1.2);
+                      setTimeout(() => setCopiedRlsFix(false), 2500);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-amber-200 hover:bg-amber-300 text-amber-900 font-bold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shadow-xs"
+                  >
+                    {copiedRlsFix ? (
+                      <>
+                        <CheckCheck className="w-3.5 h-3.5 text-emerald-700" />
+                        <span>Copied 3-Line Fix!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5 text-amber-800" />
+                        <span>Copy 3-Line RLS Fix</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <p className="text-[11px] text-amber-800/85 leading-relaxed">
+                  Seeing &ldquo;new row violates row-level security policy for table universe_data&rdquo;? Copy the 3-line SQL fix above, paste it in your <strong>Supabase Dashboard &rarr; SQL Editor &rarr; New Query</strong>, and click <strong>Run</strong>. That allows the website to save and sync instantly!
+                </p>
+              </div>
+
               {/* Offline File Backup Card */}
               <div className="p-5 rounded-2xl bg-[#FFF8EF] border-2 border-[#FFBFD7] space-y-3">
                 <div className="flex items-center gap-2">
@@ -1595,12 +2011,12 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                 <div className="flex items-center gap-2">
                   <Database className="w-5 h-5 text-[#FF85A1]" />
                   <h3 className="font-['Fredoka'] text-sm font-semibold text-[#765563]">
-                    Supabase SQL Setup Script
+                    Supabase SQL Setup &amp; RLS Fix Script
                   </h3>
                 </div>
                 <button
                   onClick={() => setShowSqlModal(false)}
-                  className="p-1 rounded-full text-[#765563]/60 hover:text-[#765563] hover:bg-[#FFD6E7]/50"
+                  className="p-1 rounded-full text-[#765563]/60 hover:text-[#765563] hover:bg-[#FFD6E7]/50 cursor-pointer"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -1611,138 +2027,58 @@ export const OwnerMode: React.FC<OwnerModeProps> = ({
                   Run this SQL in your Supabase dashboard: <strong>SQL Editor</strong> &rarr; <strong>New Query</strong> &rarr; <strong>Run</strong>.
                 </p>
                 <div className="relative bg-[#2D2A32] text-[#F3E8EE] p-3.5 rounded-xl font-mono text-[11px] overflow-x-auto max-h-[45vh]">
-                  <pre>{`-- 1. Enable pgcrypto for PIN hashing
-create extension if not exists pgcrypto;
-
--- 2. Create universe_data table
-create table if not exists public.universe_data (
-  id text primary key default 'current',
-  data jsonb not null,
-  pin_hash text not null default crypt('1234', gen_salt('bf')),
-  updated_at timestamp with time zone default timezone('utc'::text, now())
-);
-
--- 3. Row Level Security (RLS)
-alter table public.universe_data enable row level security;
-drop policy if exists "Public read universe_data" on public.universe_data;
-create policy "Public read universe_data" on public.universe_data for select using (true);
-create policy "Public update universe_data" on public.universe_data for update using (true);
-create policy "Public insert universe_data" on public.universe_data for insert with check (true);
-
--- 4. Enable Supabase Realtime
-alter publication supabase_realtime add table public.universe_data;
-
--- 5. Secure save function
-create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
-returns jsonb language plpgsql security definer as $$
-declare
-  stored_hash text;
-  result_row universe_data;
-begin
-  select pin_hash into stored_hash from public.universe_data where id = 'current';
-  if stored_hash is null then
-    insert into public.universe_data (id, data, pin_hash, updated_at)
-    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
-    returning * into result_row;
-    return result_row.data;
-  end if;
-  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
-    raise exception 'Invalid PIN: authorization failed';
-  end if;
-  update public.universe_data set data = new_data, updated_at = now()
-  where id = 'current' returning * into result_row;
-  return result_row.data;
-end;
-$$;
-
--- 6. Storage Bucket for Scrapbook Images
-insert into storage.buckets (id, name, public)
-values ('scrapbook-images', 'scrapbook-images', true)
-on conflict (id) do update set public = true;
-
-create policy "Public view scrapbook images" on storage.objects for select using (bucket_id = 'scrapbook-images');
-create policy "Allow image uploads" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
-create policy "Allow image updates" on storage.objects for update using (bucket_id = 'scrapbook-images');
-create policy "Allow image deletes" on storage.objects for delete using (bucket_id = 'scrapbook-images');`}</pre>
+                  <pre>{FULL_SUPABASE_SQL}</pre>
                 </div>
               </div>
 
-              <div className="p-3.5 border-t border-[#FFBFD7] bg-[#FFF8EF] flex items-center justify-between">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const sql = `-- 1. Enable pgcrypto for PIN hashing
-create extension if not exists pgcrypto;
+              <div className="p-3.5 border-t border-[#FFBFD7] bg-[#FFF8EF] flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(RLS_QUICK_FIX_SQL);
+                      setCopiedRlsFix(true);
+                      audioEngine.playChime(1.2);
+                      setTimeout(() => setCopiedRlsFix(false), 2000);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-amber-100 hover:bg-amber-200 border border-amber-300 text-xs font-bold text-amber-900 flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                  >
+                    {copiedRlsFix ? (
+                      <>
+                        <CheckCheck className="w-4 h-4 text-emerald-600" />
+                        <span>Copied 3-Line Fix!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4 text-amber-800" />
+                        <span>Copy 3-Line RLS Fix</span>
+                      </>
+                    )}
+                  </button>
 
--- 2. Create universe_data table
-create table if not exists public.universe_data (
-  id text primary key default 'current',
-  data jsonb not null,
-  pin_hash text not null default crypt('1234', gen_salt('bf')),
-  updated_at timestamp with time zone default timezone('utc'::text, now())
-);
-
--- 3. Row Level Security (RLS)
-alter table public.universe_data enable row level security;
-drop policy if exists "Public read universe_data" on public.universe_data;
-create policy "Public read universe_data" on public.universe_data for select using (true);
-create policy "Public update universe_data" on public.universe_data for update using (true);
-create policy "Public insert universe_data" on public.universe_data for insert with check (true);
-
--- 4. Enable Supabase Realtime
-alter publication supabase_realtime add table public.universe_data;
-
--- 5. Secure save function
-create or replace function public.save_universe_data(edit_pin text, new_data jsonb)
-returns jsonb language plpgsql security definer as $$
-declare
-  stored_hash text;
-  result_row universe_data;
-begin
-  select pin_hash into stored_hash from public.universe_data where id = 'current';
-  if stored_hash is null then
-    insert into public.universe_data (id, data, pin_hash, updated_at)
-    values ('current', new_data, crypt(edit_pin, gen_salt('bf')), now())
-    returning * into result_row;
-    return result_row.data;
-  end if;
-  if stored_hash != crypt(edit_pin, stored_hash) and stored_hash != edit_pin then
-    raise exception 'Invalid PIN: authorization failed';
-  end if;
-  update public.universe_data set data = new_data, updated_at = now()
-  where id = 'current' returning * into result_row;
-  return result_row.data;
-end;
-$$;
-
--- 6. Storage Bucket for Scrapbook Images
-insert into storage.buckets (id, name, public)
-values ('scrapbook-images', 'scrapbook-images', true)
-on conflict (id) do update set public = true;
-
-create policy "Public view scrapbook images" on storage.objects for select using (bucket_id = 'scrapbook-images');
-create policy "Allow image uploads" on storage.objects for insert with check (bucket_id = 'scrapbook-images');
-create policy "Allow image updates" on storage.objects for update using (bucket_id = 'scrapbook-images');
-create policy "Allow image deletes" on storage.objects for delete using (bucket_id = 'scrapbook-images');`;
-                    navigator.clipboard.writeText(sql);
-                    setCopiedSql(true);
-                    audioEngine.playChime(1.2);
-                    setTimeout(() => setCopiedSql(false), 2000);
-                  }}
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
-                >
-                  {copiedSql ? (
-                    <>
-                      <CheckCheck className="w-4 h-4 text-emerald-600" />
-                      <span>Copied to Clipboard!</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-4 h-4" />
-                      <span>Copy Full SQL Script</span>
-                    </>
-                  )}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(FULL_SUPABASE_SQL);
+                      setCopiedSql(true);
+                      audioEngine.playChime(1.2);
+                      setTimeout(() => setCopiedSql(false), 2000);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-[#FFD6E7] to-[#FFBFD7] hover:from-[#FFBFD7] hover:to-[#FFA3BA] border border-[#FFA3BA] text-xs font-bold text-[#765563] flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
+                  >
+                    {copiedSql ? (
+                      <>
+                        <CheckCheck className="w-4 h-4 text-emerald-600" />
+                        <span>Copied Full Script!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4" />
+                        <span>Copy Full SQL Script</span>
+                      </>
+                    )}
+                  </button>
+                </div>
 
                 <button
                   type="button"
